@@ -41,6 +41,95 @@ def _lazy_import_pipeline():
     return Trellis2ImageTo3DPipeline
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    v = str(os.environ.get(name, "")).strip().lower()
+    if not v:
+        return default
+    if v in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "f", "no", "n", "off"):
+        return False
+    return default
+
+
+def _should_avoid_gated_deps() -> bool:
+    # Default to avoiding gated repos so the worker can boot on fresh machines.
+    return _bool_env("TRELLIS2_AVOID_GATED_DEPS", True)
+
+
+def _is_gated_repo_error(exc: BaseException) -> bool:
+    msg = (str(exc) or "").lower()
+    # Common HF hub/transformers error strings for gated repos.
+    if "gated repo" in msg:
+        return True
+    if "cannot access gated repo" in msg:
+        return True
+    if "access to model" in msg and "restricted" in msg:
+        return True
+    if "403" in msg and "huggingface.co" in msg:
+        return True
+    return False
+
+
+def _build_pipeline_with_image_cond_override(model_id: str):
+    """
+    Build a Trellis2ImageTo3DPipeline but override the image conditioning model
+    to avoid gated dependencies (e.g. DINOv3 on HF).
+    """
+    from trellis2.pipelines.base import Pipeline  # type: ignore
+    from trellis2.pipelines import samplers, rembg  # type: ignore
+    from trellis2.modules import image_feature_extractor  # type: ignore
+
+    Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
+
+    # Load pipeline.json + model weights without instantiating the image conditioner yet.
+    pipe = Pipeline.from_pretrained.__func__(Trellis2ImageTo3DPipeline, model_id, "pipeline.json")  # type: ignore[attr-defined]
+    args = getattr(pipe, "_pretrained_args", None) or {}
+
+    # Prefer a non-gated vision backbone. TRELLIS.2 ships DinoV2FeatureExtractor.
+    dinov2_name = os.environ.get("TRELLIS2_DINOV2_MODEL_NAME", "dinov2_vitl14_reg").strip()
+    args["image_cond_model"] = {
+        "name": "DinoV2FeatureExtractor",
+        "args": {"model_name": dinov2_name},
+    }
+
+    # Recreate the rest of the pipeline fields, matching upstream behavior.
+    pipe.sparse_structure_sampler = getattr(samplers, args["sparse_structure_sampler"]["name"])(  # type: ignore[attr-defined]
+        **args["sparse_structure_sampler"]["args"]
+    )
+    pipe.sparse_structure_sampler_params = args["sparse_structure_sampler"]["params"]  # type: ignore[attr-defined]
+
+    pipe.shape_slat_sampler = getattr(samplers, args["shape_slat_sampler"]["name"])(  # type: ignore[attr-defined]
+        **args["shape_slat_sampler"]["args"]
+    )
+    pipe.shape_slat_sampler_params = args["shape_slat_sampler"]["params"]  # type: ignore[attr-defined]
+
+    pipe.tex_slat_sampler = getattr(samplers, args["tex_slat_sampler"]["name"])(  # type: ignore[attr-defined]
+        **args["tex_slat_sampler"]["args"]
+    )
+    pipe.tex_slat_sampler_params = args["tex_slat_sampler"]["params"]  # type: ignore[attr-defined]
+
+    pipe.shape_slat_normalization = args["shape_slat_normalization"]  # type: ignore[attr-defined]
+    pipe.tex_slat_normalization = args["tex_slat_normalization"]  # type: ignore[attr-defined]
+
+    pipe.image_cond_model = getattr(image_feature_extractor, args["image_cond_model"]["name"])(  # type: ignore[attr-defined]
+        **args["image_cond_model"]["args"]
+    )
+    pipe.rembg_model = getattr(rembg, args["rembg_model"]["name"])(**args["rembg_model"]["args"])  # type: ignore[attr-defined]
+
+    pipe.low_vram = args.get("low_vram", True)  # type: ignore[attr-defined]
+    pipe.default_pipeline_type = args.get("default_pipeline_type", "1024_cascade")  # type: ignore[attr-defined]
+    pipe.pbr_attr_layout = {  # type: ignore[attr-defined]
+        "base_color": slice(0, 3),
+        "metallic": slice(3, 4),
+        "roughness": slice(4, 5),
+        "alpha": slice(5, 6),
+    }
+    pipe._device = "cpu"  # type: ignore[attr-defined]
+
+    return pipe
+
+
 def _get_pipeline():
     global _PIPELINE
     if _PIPELINE is not None:
@@ -55,7 +144,18 @@ def _get_pipeline():
     model_id = os.environ.get("TRELLIS2_MODEL_ID", "microsoft/TRELLIS.2-4B")
     Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
 
-    pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
+    try:
+        if _should_avoid_gated_deps():
+            pipe = _build_pipeline_with_image_cond_override(model_id)
+        else:
+            pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
+    except Exception as e:
+        # If the upstream config points at a gated model (e.g. facebook/dinov3-*),
+        # fall back to a non-gated image conditioner.
+        if (not _should_avoid_gated_deps()) and _is_gated_repo_error(e):
+            pipe = _build_pipeline_with_image_cond_override(model_id)
+        else:
+            raise
     dev = _get_device()
     if dev == "cuda":
         pipe.cuda()
