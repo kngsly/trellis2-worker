@@ -17,3 +17,4 @@ kornia
 timm
 zstandard
 plyfile
+einops
