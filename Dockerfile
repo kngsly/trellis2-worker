@@ -82,7 +82,7 @@ if marker not in s:
 
 print("CuMesh setup.py patched for extended lambdas")
 PY
-    && grep -q -- "--extended-lambda" /tmp/extensions/CuMesh/setup.py \
+RUN grep -q -- "--extended-lambda" /tmp/extensions/CuMesh/setup.py \
     && pip install /tmp/extensions/CuMesh --no-build-isolation
 
 # FlexGEMM
