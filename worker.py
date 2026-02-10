@@ -284,6 +284,83 @@ def _preprocess_images(pipe, images: List[Image.Image]) -> List[Image.Image]:
     return out
 
 
+def _has_transparency(im: Image.Image) -> bool:
+    try:
+        if im.mode == "RGBA":
+            mn, mx = im.getchannel("A").getextrema()
+            return mn < 255 or mx < 255
+        if im.mode == "LA":
+            mn, mx = im.getchannel("A").getextrema()
+            return mn < 255 or mx < 255
+        if im.mode == "P" and "transparency" in getattr(im, "info", {}):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _crop_to_alpha(im: Image.Image, pad: int = 8) -> Image.Image:
+    """Crop around non-zero alpha to avoid huge transparent borders."""
+    try:
+        im = im.convert("RGBA")
+        a = im.getchannel("A")
+        bbox = a.getbbox()
+        if not bbox:
+            return im
+        x0, y0, x1, y1 = bbox
+        x0 = max(0, x0 - pad)
+        y0 = max(0, y0 - pad)
+        x1 = min(im.size[0], x1 + pad)
+        y1 = min(im.size[1], y1 + pad)
+        return im.crop((x0, y0, x1, y1))
+    except Exception:
+        return im
+
+
+def _prepare_input_image(im: Image.Image) -> Image.Image:
+    """
+    Prepare an image for pipeline.run().
+
+    Transparent "asset" PNGs often have huge empty borders; cropping to alpha bbox improves
+    conditioning and can prevent empty sparse sampling.
+    """
+    # Optionally force RGB by compositing alpha onto a white background. This can help when
+    # downstream models don't behave well with RGBA inputs.
+    if _bool_env("TRELLIS2_FORCE_RGB", False):
+        try:
+            im_rgba = im.convert("RGBA")
+            bg = Image.new("RGBA", im_rgba.size, (255, 255, 255, 255))
+            im = Image.alpha_composite(bg, im_rgba).convert("RGB")
+        except Exception:
+            im = im.convert("RGB")
+
+    if _bool_env("TRELLIS2_CROP_ALPHA", True) and _has_transparency(im):
+        im = _crop_to_alpha(im)
+
+    # Preserve alpha if present, otherwise normalize to RGB.
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in getattr(im, "info", {})):
+        im = im.convert("RGBA")
+    else:
+        im = im.convert("RGB")
+
+    # Many "asset" PNGs are tiny after alpha-cropping; upscale to give the vision backbone
+    # enough pixels to work with. This only upscales, never downscales.
+    if _bool_env("TRELLIS2_UPSCALE_SMALL", True):
+        try:
+            target = _int_env("TRELLIS2_UPSCALE_TARGET", 512)
+            mx = max(im.size)
+            if mx > 0 and mx < target:
+                scale = float(target) / float(mx)
+                im = im.resize(
+                    (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+        except Exception:
+            pass
+
+    return im
+
+
 def _fuse_cond(cond_tensor):
     """
     Fuse per-image conditioning into a single prompt conditioning.
@@ -342,6 +419,7 @@ def generate_glb_from_image_bytes_list(
     low_poly: bool = False,
     seed: Optional[int] = None,
     pipeline_type: Optional[str] = None,
+    preprocess_image: Optional[bool] = None,
     backup_inputs: bool = True,
 ) -> Path:
     if not images_bytes:
@@ -355,7 +433,8 @@ def generate_glb_from_image_bytes_list(
     for raw in images_bytes:
         if not raw:
             continue
-        im = Image.open(io.BytesIO(raw)).convert("RGBA")
+        im = Image.open(io.BytesIO(raw))
+        im = _prepare_input_image(im)
         imgs.append(im)
     if not imgs:
         raise ValueError("empty image bytes")
@@ -371,73 +450,87 @@ def generate_glb_from_image_bytes_list(
             except Exception:
                 pass
 
-    # Preprocess (background removal + crop)
-    pre = _preprocess_images(pipe, imgs)
-
-    import torch
+    # IMPORTANT:
+    # Use the upstream pipeline's `run()` method so we inherit the correct preprocess,
+    # sampler params, and cascade behavior. Re-implementing sampling with empty/default
+    # params can produce garbage outputs even when it "succeeds".
+    #
+    # For now we use the first image only; multi-image fusion can be added later.
+    import inspect
     import o_voxel  # type: ignore
 
-    if seed is None:
-        # A deterministic default is useful for debugging; caller can override.
-        seed = 42
-    torch.manual_seed(int(seed))
-
     ptype = _resolve_pipeline_type(pipeline_type)
-    cond_512 = _get_fused_cond(pipe, pre, 512)
-    cond_1024 = _get_fused_cond(pipe, pre, 1024) if ptype != "512" else None
+    img0 = imgs[0]
 
-    # Replicate Trellis2ImageTo3DPipeline.run(), but use fused cond from multiple images.
-    if ptype == "512":
-        ss_res = 32
-        coords = pipe.sample_sparse_structure(cond_512, ss_res, num_samples=1, sampler_params={})
-        shape_slat = pipe.sample_shape_slat(cond_512, pipe.models["shape_slat_flow_model_512"], coords, sampler_params={})
-        tex_slat = pipe.sample_tex_slat(cond_512, pipe.models["tex_slat_flow_model_512"], shape_slat, sampler_params={})
-        res = 512
-    elif ptype == "1024":
-        if cond_1024 is None:
-            raise ValueError("cond_1024 missing")
-        ss_res = 64
-        coords = pipe.sample_sparse_structure(cond_512, ss_res, num_samples=1, sampler_params={})
-        shape_slat = pipe.sample_shape_slat(cond_1024, pipe.models["shape_slat_flow_model_1024"], coords, sampler_params={})
-        tex_slat = pipe.sample_tex_slat(cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, sampler_params={})
-        res = 1024
-    elif ptype == "1024_cascade":
-        if cond_1024 is None:
-            raise ValueError("cond_1024 missing")
-        coords = pipe.sample_sparse_structure(cond_512, 32, num_samples=1, sampler_params={})
-        shape_slat, res = pipe.sample_shape_slat_cascade(
-            cond_512,
-            cond_1024,
-            pipe.models["shape_slat_flow_model_512"],
-            pipe.models["shape_slat_flow_model_1024"],
-            512,
-            1024,
-            coords,
-            sampler_params={},
-            max_num_tokens=_int_env("TRELLIS2_MAX_NUM_TOKENS", 49152),
-        )
-        tex_slat = pipe.sample_tex_slat(cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, sampler_params={})
-    elif ptype == "1536_cascade":
-        if cond_1024 is None:
-            raise ValueError("cond_1024 missing")
-        coords = pipe.sample_sparse_structure(cond_512, 32, num_samples=1, sampler_params={})
-        shape_slat, res = pipe.sample_shape_slat_cascade(
-            cond_512,
-            cond_1024,
-            pipe.models["shape_slat_flow_model_512"],
-            pipe.models["shape_slat_flow_model_1024"],
-            512,
-            1536,
-            coords,
-            sampler_params={},
-            max_num_tokens=_int_env("TRELLIS2_MAX_NUM_TOKENS", 49152),
-        )
-        tex_slat = pipe.sample_tex_slat(cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, sampler_params={})
-    else:
-        raise ValueError(f"invalid pipeline_type: {ptype}")
+    import torch
 
-    torch.cuda.empty_cache()
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    # Default seed: deterministic for easier debugging; caller can override.
+    if seed is None:
+        seed = _int_env("TRELLIS2_DEFAULT_SEED", 42)
+
+    # Pass only kwargs supported by this pipeline version.
+    kwargs = {}
+    try:
+        sig = inspect.signature(pipe.run)  # type: ignore[attr-defined]
+        if "seed" in sig.parameters:
+            kwargs["seed"] = int(seed)
+        if ptype and "pipeline_type" in sig.parameters:
+            kwargs["pipeline_type"] = ptype
+        if "num_samples" in sig.parameters:
+            kwargs["num_samples"] = 1
+        if "preprocess_image" in sig.parameters:
+            if preprocess_image is None:
+                kwargs["preprocess_image"] = _bool_env("TRELLIS2_PREPROCESS_IMAGE", True)
+            else:
+                kwargs["preprocess_image"] = bool(preprocess_image)
+    except Exception:
+        # If signature inspection fails, still attempt a minimal call.
+        kwargs["seed"] = int(seed)
+        if ptype:
+            kwargs["pipeline_type"] = ptype
+
+    # Retry on empty sparse sampling by shifting the seed.
+    def _is_empty_sparse_error(exc: BaseException) -> bool:
+        msg = (str(exc) or "").lower()
+        return ("input.numel() == 0" in msg) or ("max(): expected reduction dim" in msg)
+
+    retries = _int_env("TRELLIS2_EMPTY_SPARSE_RETRIES", 4)
+    last_err: Optional[BaseException] = None
+
+    # Some inputs get wiped out by TRELLIS preprocessing (background removal + crop), which can
+    # lead to empty sparse coords. If that happens, we auto-fallback by toggling preprocess_image.
+    preprocess_toggle_attempted = False
+    base_preprocess = kwargs.get("preprocess_image", None)
+
+    attempt = 0
+    max_attempts = max(1, retries)
+    while True:
+        try:
+            torch.manual_seed(int(seed) + attempt)
+            if "seed" in kwargs:
+                kwargs["seed"] = int(seed) + attempt
+            out = pipe.run(img0, **kwargs)  # type: ignore[attr-defined]
+            if not out:
+                raise RuntimeError("pipeline.run() returned no outputs")
+            mesh = out[0]
+            break
+        except Exception as e:
+            last_err = e
+            if not _is_empty_sparse_error(e):
+                raise
+
+            attempt += 1
+            if attempt < max_attempts:
+                continue
+
+            # If we exhausted seed-shift retries, flip preprocess_image once and try again.
+            if (not preprocess_toggle_attempted) and ("preprocess_image" in kwargs):
+                preprocess_toggle_attempted = True
+                attempt = 0
+                kwargs["preprocess_image"] = (not bool(base_preprocess))
+                continue
+
+            raise RuntimeError("pipeline.run() failed after retries") from last_err
 
     # Export to GLB via o-voxel postprocess util.
     decimation_target, texture_size = _choose_export_params(low_poly)

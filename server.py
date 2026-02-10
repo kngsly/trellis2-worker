@@ -8,7 +8,7 @@ Endpoints:
   - POST /generate (multipart 'image' and/or repeated 'images') -> {"success": true, "glb_path": "/outputs/<file>.glb"} or {"success": false, "error": "..."}
   - GET  /download/{filename} -> returns file bytes
 
-Response shape mirrors the Hunyuan worker so the Bun app and rent.py can reuse the same protocol.
+Response shape mirrors other workers so a client can reuse the same protocol.
 """
 
 from __future__ import annotations
@@ -70,11 +70,13 @@ async def generate(
     low_poly: Optional[str] = Form(None),
     seed: Optional[str] = Form(None),
     pipeline_type: Optional[str] = Form(None),
+    preprocess_image: Optional[str] = Form(None),
     backup_inputs: Optional[str] = Form(None),
 ):
     try:
         want_low_poly = _parse_bool(low_poly, default=False)
         want_backup = _parse_bool(backup_inputs, default=True)
+        want_preprocess = _parse_bool(preprocess_image, default=True) if preprocess_image is not None else None
         safe_seed = None
         if seed is not None and str(seed).strip():
             try:
@@ -106,6 +108,7 @@ async def generate(
             low_poly=want_low_poly,
             seed=safe_seed,
             pipeline_type=str(pipeline_type).strip() if pipeline_type else None,
+            preprocess_image=want_preprocess,
             backup_inputs=want_backup,
         )
         return JSONResponse({"success": True, "glb_path": str(out_path)}, status_code=200)
@@ -129,4 +132,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=APP_PORT, log_level="info")
-

@@ -1,13 +1,13 @@
-# TRELLIS.2 Vast Worker Image
+# TRELLIS.2 Worker Image
 
-This folder contains a FastAPI worker container intended to run on Vast.ai and provide a stable HTTP API for the app:
+This folder contains a FastAPI worker container intended to run on GPU VMs and provide a stable HTTP API for a client:
 
 - `GET /health` -> `{"status":"OK"}`
 - `GET /ready`  -> `{"ready": true|false, ...}`
 - `POST /generate` (multipart: `image` and/or repeated `images`) -> JSON `{success, glb_path}` or `{success:false, error}`
 - `GET /download/{filename}` -> returns file bytes
 
-The API shape mirrors the existing Hunyuan worker so `services/vast-ai/rent.py` and the Bun app can keep working.
+The API shape mirrors other workers so a client can keep using the same protocol.
 
 ## Multi-image support
 
@@ -30,4 +30,3 @@ The API shape mirrors the existing Hunyuan worker so `services/vast-ai/rent.py` 
 
 TRELLIS.2 has heavyweight CUDA/C++ dependencies (`o-voxel`, `CuMesh`, `FlexGEMM`, `nvdiffrast`, etc.).
 The `Dockerfile` in this folder is a pragmatic starting point, but you may need to iterate based on your target GPU/driver.
-

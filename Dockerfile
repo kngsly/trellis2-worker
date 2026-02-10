@@ -33,8 +33,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN ln -sf /usr/bin/python3.10 /usr/bin/python && ln -sf /usr/bin/pip3 /usr/bin/pip
 
+# Keep build tooling current; some sdists (flash-attn) fail metadata generation on older pip/setuptools.
+RUN python -m pip install --upgrade pip setuptools wheel
+
 # Torch first (CUDA 12.4)
 RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+
+# TRELLIS.2 sparse attention defaults to flash-attn; install it so /generate doesn't crash.
+# See: https://github.com/Dao-AILab/flash-attention#installation-and-features
+#
+# Prefer wheels when available (fast, reliable). If a wheel isn't available for the current
+# torch/cuda/python combo, fall back to building from source.
+RUN pip install --only-binary=:all: flash-attn==2.7.4.post1 \
+    || pip install flash-attn==2.7.4.post1 --no-build-isolation
 
 # Clone TRELLIS.2 source (used via PYTHONPATH; the repo does not ship as a pip package).
 WORKDIR /opt/trellis2
