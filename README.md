@@ -2,7 +2,7 @@
 
 Dedicated Docker image + HTTP worker for TRELLIS.2 image-to-3D, intended to run on GPU VMs (e.g. Vast.ai).
 
-This repo exists so we never have to upload the full `the private application repo` repo (and any secrets) to random GPU boxes.
+This repo exists so we never have to upload the full private application repo (and any secrets) to random GPU boxes.
 
 ## What Runs
 
@@ -88,4 +88,3 @@ docker tag kngsly/trellis2-worker:2026-02-10 kngsly/trellis2-worker:latest
 docker push kngsly/trellis2-worker:2026-02-10
 docker push kngsly/trellis2-worker:latest
 ```
-
