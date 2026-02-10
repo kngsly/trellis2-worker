@@ -57,6 +57,11 @@ def _should_avoid_gated_deps() -> bool:
     return _bool_env("TRELLIS2_AVOID_GATED_DEPS", True)
 
 
+def _should_avoid_gated_rembg_deps() -> bool:
+    # RMBG-2.0 is gated on HF; default to a public alternative.
+    return _bool_env("TRELLIS2_AVOID_GATED_REMBG_DEPS", True)
+
+
 def _is_gated_repo_error(exc: BaseException) -> bool:
     msg = (str(exc) or "").lower()
     # Common HF hub/transformers error strings for gated repos.
@@ -88,12 +93,67 @@ def _build_pipeline_with_image_cond_override(model_id: str):
 
     # Prefer a non-gated vision backbone. TRELLIS.2 ships DinoV2FeatureExtractor.
     dinov2_name = os.environ.get("TRELLIS2_DINOV2_MODEL_NAME", "dinov2_vitl14_reg").strip()
-    args["image_cond_model"] = {
-        "name": "DinoV2FeatureExtractor",
-        "args": {"model_name": dinov2_name},
-    }
+    args["image_cond_model"] = {"name": "DinoV2FeatureExtractor", "args": {"model_name": dinov2_name}}
+
+    if _should_avoid_gated_rembg_deps():
+        # Default BiRefNet model is public; RMBG-2.0 is gated.
+        rembg_id = os.environ.get("TRELLIS2_REMBG_MODEL_ID", "ZhengPeng7/BiRefNet").strip()
+        args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_id}}
 
     # Recreate the rest of the pipeline fields, matching upstream behavior.
+    pipe.sparse_structure_sampler = getattr(samplers, args["sparse_structure_sampler"]["name"])(  # type: ignore[attr-defined]
+        **args["sparse_structure_sampler"]["args"]
+    )
+    pipe.sparse_structure_sampler_params = args["sparse_structure_sampler"]["params"]  # type: ignore[attr-defined]
+
+    pipe.shape_slat_sampler = getattr(samplers, args["shape_slat_sampler"]["name"])(  # type: ignore[attr-defined]
+        **args["shape_slat_sampler"]["args"]
+    )
+    pipe.shape_slat_sampler_params = args["shape_slat_sampler"]["params"]  # type: ignore[attr-defined]
+
+    pipe.tex_slat_sampler = getattr(samplers, args["tex_slat_sampler"]["name"])(  # type: ignore[attr-defined]
+        **args["tex_slat_sampler"]["args"]
+    )
+    pipe.tex_slat_sampler_params = args["tex_slat_sampler"]["params"]  # type: ignore[attr-defined]
+
+    pipe.shape_slat_normalization = args["shape_slat_normalization"]  # type: ignore[attr-defined]
+    pipe.tex_slat_normalization = args["tex_slat_normalization"]  # type: ignore[attr-defined]
+
+    pipe.image_cond_model = getattr(image_feature_extractor, args["image_cond_model"]["name"])(  # type: ignore[attr-defined]
+        **args["image_cond_model"]["args"]
+    )
+    pipe.rembg_model = getattr(rembg, args["rembg_model"]["name"])(**args["rembg_model"]["args"])  # type: ignore[attr-defined]
+
+    pipe.low_vram = args.get("low_vram", True)  # type: ignore[attr-defined]
+    pipe.default_pipeline_type = args.get("default_pipeline_type", "1024_cascade")  # type: ignore[attr-defined]
+    pipe.pbr_attr_layout = {  # type: ignore[attr-defined]
+        "base_color": slice(0, 3),
+        "metallic": slice(3, 4),
+        "roughness": slice(4, 5),
+        "alpha": slice(5, 6),
+    }
+    pipe._device = "cpu"  # type: ignore[attr-defined]
+
+    return pipe
+
+
+def _build_pipeline_with_rembg_override(model_id: str):
+    """
+    Build a Trellis2ImageTo3DPipeline but override only the rembg (background removal) model
+    to avoid gated dependencies (e.g. briaai/RMBG-2.0 on HF) while keeping the default image
+    conditioning model (DINOv3) intact.
+    """
+    from trellis2.pipelines.base import Pipeline  # type: ignore
+    from trellis2.pipelines import samplers, rembg  # type: ignore
+    from trellis2.modules import image_feature_extractor  # type: ignore
+
+    Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
+    pipe = Pipeline.from_pretrained.__func__(Trellis2ImageTo3DPipeline, model_id, "pipeline.json")  # type: ignore[attr-defined]
+    args = getattr(pipe, "_pretrained_args", None) or {}
+
+    rembg_id = os.environ.get("TRELLIS2_REMBG_MODEL_ID", "ZhengPeng7/BiRefNet").strip()
+    args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_id}}
+
     pipe.sparse_structure_sampler = getattr(samplers, args["sparse_structure_sampler"]["name"])(  # type: ignore[attr-defined]
         **args["sparse_structure_sampler"]["args"]
     )
@@ -147,13 +207,19 @@ def _get_pipeline():
     try:
         if _should_avoid_gated_deps():
             pipe = _build_pipeline_with_image_cond_override(model_id)
+        elif _should_avoid_gated_rembg_deps():
+            pipe = _build_pipeline_with_rembg_override(model_id)
         else:
             pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
     except Exception as e:
-        # If the upstream config points at a gated model (e.g. facebook/dinov3-*),
-        # fall back to a non-gated image conditioner.
-        if (not _should_avoid_gated_deps()) and _is_gated_repo_error(e):
-            pipe = _build_pipeline_with_image_cond_override(model_id)
+        # If the upstream config points at a gated model, fall back to a non-gated alternative.
+        if _is_gated_repo_error(e):
+            if _should_avoid_gated_deps():
+                pipe = _build_pipeline_with_image_cond_override(model_id)
+            elif _should_avoid_gated_rembg_deps():
+                pipe = _build_pipeline_with_rembg_override(model_id)
+            else:
+                raise
         else:
             raise
     dev = _get_device()
