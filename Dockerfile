@@ -59,8 +59,13 @@ RUN mkdir -p /tmp/extensions \
     && git clone --recursive https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh \
     # CuMesh's setup.py only enables --extended-lambda on Windows by default, but cubvh
     # uses host/device lambdas on Linux too. Patch it in so nvcc can compile cubvh.
-    && python -c "from pathlib import Path; p=Path('/tmp/extensions/CuMesh/setup.py'); s=p.read_text(encoding='utf-8'); before='nvcc_flags += [\\n        \"-O3\",\\n        \"-std=c++17\"\\n    ]'; after='nvcc_flags += [\\n        \"-O3\",\\n        \"-std=c++17\",\\n        \"--expt-relaxed-constexpr\",\\n        \"--extended-lambda\"\\n    ]'; s2=s.replace(before, after); p.write_text(s2, encoding='utf-8'); print('patched CuMesh setup.py for --extended-lambda' if s2!=s else 'CuMesh setup.py already patched')" \
-    && grep -q -- '--extended-lambda' /tmp/extensions/CuMesh/setup.py \
+    && python -c \"from pathlib import Path; p=Path('/tmp/extensions/CuMesh/setup.py'); s=p.read_text(encoding='utf-8'); m='# trellis2-worker build patch: enable extended lambdas'; \
+if m not in s: \
+  if 'nvcc_flags = []' not in s: raise SystemExit('ERROR: CuMesh setup.py changed; cannot find nvcc_flags'); \
+  s=s.replace('nvcc_flags = []', 'nvcc_flags = []\\n\\n'+m+'\\n# cubvh uses __host__/__device__ lambdas; nvcc needs --extended-lambda.\\n# Add it globally (safe if duplicated in platform-specific blocks).\\nnvcc_flags += [\\\"--extended-lambda\\\", \\\"--expt-relaxed-constexpr\\\"]'); \
+  p.write_text(s, encoding='utf-8'); \
+print('patched CuMesh setup.py for --extended-lambda')\" \
+    && grep -q -- \"# trellis2-worker build patch: enable extended lambdas\" /tmp/extensions/CuMesh/setup.py \
     && pip install /tmp/extensions/CuMesh --no-build-isolation
 
 # FlexGEMM
