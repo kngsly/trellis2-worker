@@ -1,0 +1,19 @@
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# Basic deps from TRELLIS.2 setup.sh --basic (trimmed; adjust as needed)
+numpy
+opencv-python-headless
+pillow
+imageio
+imageio-ffmpeg
+tqdm
+easydict
+ninja
+trimesh
+transformers
+kornia
+timm
+zstandard
+
