@@ -57,6 +57,10 @@ RUN mkdir -p /tmp/extensions \
 # CuMesh
 RUN mkdir -p /tmp/extensions \
     && git clone --recursive https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh \
+    # CuMesh's setup.py only enables --extended-lambda on Windows by default, but cubvh
+    # uses host/device lambdas on Linux too. Patch it in so nvcc can compile cubvh.
+    && python -c "from pathlib import Path; p=Path('/tmp/extensions/CuMesh/setup.py'); s=p.read_text(encoding='utf-8'); before='nvcc_flags += [\\n        \"-O3\",\\n        \"-std=c++17\"\\n    ]'; after='nvcc_flags += [\\n        \"-O3\",\\n        \"-std=c++17\",\\n        \"--expt-relaxed-constexpr\",\\n        \"--extended-lambda\"\\n    ]'; s2=s.replace(before, after); p.write_text(s2, encoding='utf-8'); print('patched CuMesh setup.py for --extended-lambda' if s2!=s else 'CuMesh setup.py already patched')" \
+    && grep -q -- '--extended-lambda' /tmp/extensions/CuMesh/setup.py \
     && pip install /tmp/extensions/CuMesh --no-build-isolation
 
 # FlexGEMM
