@@ -52,7 +52,11 @@ RUN pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e402
 # nvdiffrast
 RUN mkdir -p /tmp/extensions \
     && git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast \
-    && pip install /tmp/extensions/nvdiffrast --no-build-isolation
+    && pip install /tmp/extensions/nvdiffrast --no-build-isolation \
+    # The upstream nvdiffrast build can successfully compile the extension but fail to install the
+    # Python package directory (then `import nvdiffrast` breaks at runtime). Ensure the package is
+    # present in site-packages, then verify import.
+    && python - <<'PY'\nimport shutil\nfrom pathlib import Path\nimport sysconfig\n\nsrc = Path('/tmp/extensions/nvdiffrast/nvdiffrast')\ndst_root = Path(sysconfig.get_paths()['purelib'])\ndst = dst_root / 'nvdiffrast'\n\nif not src.is_dir():\n    raise SystemExit(f'ERROR: nvdiffrast source package dir missing: {src}')\n\n# Ensure python package files exist where imports expect them.\nshutil.copytree(src, dst, dirs_exist_ok=True)\n\nimport nvdiffrast.torch as _dr  # noqa: F401\nprint('nvdiffrast import OK')\nPY
 
 # CuMesh
 RUN mkdir -p /tmp/extensions \
