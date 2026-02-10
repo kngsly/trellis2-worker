@@ -56,7 +56,7 @@ RUN mkdir -p /tmp/extensions \
     # The upstream nvdiffrast build can compile the extension but fail to install the Python package
     # directory (then `import nvdiffrast` breaks at runtime). Force-copy the package into
     # site-packages and verify import.
-    && python -c "import shutil,sysconfig; from pathlib import Path; src=Path('/tmp/extensions/nvdiffrast/nvdiffrast'); assert src.is_dir(), f'missing {src}'; dst=Path(sysconfig.get_paths()['purelib'])/'nvdiffrast'; shutil.copytree(src, dst, dirs_exist_ok=True); import nvdiffrast.torch as _dr; print('nvdiffrast import OK')"
+    && python -c "import shutil,sysconfig; from pathlib import Path; src=Path('/tmp/extensions/nvdiffrast/nvdiffrast'); assert src.is_dir(), f'missing {src}'; dst=Path(sysconfig.get_paths()['purelib'])/'nvdiffrast'; shutil.copytree(src, dst, dirs_exist_ok=True); p=dst/'__init__.py'; p.write_text('''from importlib.metadata import version\\n\\ntry:\\n    __version__ = version(__package__ or \\\"nvdiffrast\\\")\\nexcept Exception:\\n    __version__ = \\\"0.0.0\\\"\\n''', encoding='utf-8'); import nvdiffrast.torch as _dr; print('nvdiffrast import OK')"
 
 # CuMesh
 RUN mkdir -p /tmp/extensions \
