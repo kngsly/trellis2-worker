@@ -53,8 +53,9 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 
 def _should_avoid_gated_deps() -> bool:
-    # Default to avoiding gated repos so the worker can boot on fresh machines.
-    return _bool_env("TRELLIS2_AVOID_GATED_DEPS", True)
+    # Using a different image conditioner than the one specified by the checkpoint (pipeline.json)
+    # can severely degrade output quality. Default to upstream behavior unless explicitly overridden.
+    return _bool_env("TRELLIS2_AVOID_GATED_DEPS", False)
 
 
 def _should_avoid_gated_rembg_deps() -> bool:
@@ -552,8 +553,10 @@ def generate_glb_from_image_bytes_list(
     )
 
     out_path = out_dir / f"{uid}.glb"
-    # Use webp textures to keep output compact.
-    glb.export(str(out_path), extension_webp=True)
+    # Blender compatibility: many installs do not decode embedded WebP textures.
+    # Default to PNG; enable WebP explicitly if you want smaller files.
+    export_webp = _bool_env("TRELLIS2_EXPORT_WEBP", False)
+    glb.export(str(out_path), extension_webp=export_webp)
 
     dt = time.time() - t0
     print(
