@@ -52,6 +52,135 @@ WORKDIR /opt/trellis2
 RUN git clone --depth 1 --recursive https://github.com/microsoft/TRELLIS.2.git src
 ENV PYTHONPATH=/opt/trellis2/src
 
+# Patch upstream TRELLIS.2 for worker reliability:
+# - BiRefNet dtype/device mismatch (float vs half) during rembg preprocessing
+# - Robust alpha bbox cropping (avoid empty bbox when alpha is soft/empty)
+# - Guard against empty sparse coords (raise a clearer error instead of crashing deeper in sparse ops)
+# - Postprocess cleanup after remesh (reduce floaters / disconnected components in exported meshes)
+RUN python - <<'PY'
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+root = Path("/opt/trellis2/src")
+
+def patch_file(path: Path, fn):
+    s = path.read_text(encoding="utf-8")
+    out = fn(s)
+    if out != s:
+        path.write_text(out, encoding="utf-8")
+        return True
+    return False
+
+# 1) BiRefNet dtype fix
+biref = root / "trellis2" / "pipelines" / "rembg" / "BiRefNet.py"
+marker = "# trellis2-worker build patch: match input dtype/device to model params"
+def patch_biref(s: str) -> str:
+    if marker in s:
+        return s
+    # Replace the hardcoded .to("cuda") line with a device+dtype-aware version.
+    pat = r'^(\\s*)input_images\\s*=\\s*self\\.transform_image\\(image\\)\\.unsqueeze\\(0\\)\\.to\\(\"cuda\"\\)\\s*$'
+    m = re.search(pat, s, flags=re.M)
+    if not m:
+        raise SystemExit("ERROR: BiRefNet.py changed; cannot find input_images assignment to patch")
+    indent = m.group(1)
+    repl = (
+        f"{indent}input_images = self.transform_image(image).unsqueeze(0)\\n"
+        f"{indent}{marker}\\n"
+        f"{indent}param = next(self.model.parameters())\\n"
+        f"{indent}input_images = input_images.to(device=param.device, dtype=param.dtype)\\n"
+    )
+    return re.sub(pat, repl.rstrip("\\n"), s, flags=re.M)
+
+patched = patch_file(biref, patch_biref)
+print(f"Patched BiRefNet dtype/device: {patched}")
+
+# 2) Robust bbox cropping in preprocess_image
+p = root / "trellis2" / "pipelines" / "trellis2_image_to_3d.py"
+pre_marker = "# trellis2-worker build patch: robust alpha bbox"
+def patch_preprocess_bbox(s: str) -> str:
+    if pre_marker in s:
+        return s
+    needle = (
+        "        bbox = np.argwhere(alpha > 0.8 * 255)\\n"
+        "        bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])\\n"
+    )
+    if needle not in s:
+        # Best-effort: don't fail the build if upstream already fixed it.
+        print("WARN: preprocess_image bbox needle not found; skipping bbox robustness patch")
+        return s
+    repl = (
+        f"        {pre_marker}\\n"
+        "        bbox_coords = np.argwhere(alpha > 0.8 * 255)\\n"
+        "        if bbox_coords.size == 0:\\n"
+        "            bbox_coords = np.argwhere(alpha > 0)\\n"
+        "        if bbox_coords.size == 0:\\n"
+        "            bbox = (0, 0, alpha.shape[1] - 1, alpha.shape[0] - 1)\\n"
+        "        else:\\n"
+        "            bbox = (\\n"
+        "                np.min(bbox_coords[:, 1]),\\n"
+        "                np.min(bbox_coords[:, 0]),\\n"
+        "                np.max(bbox_coords[:, 1]),\\n"
+        "                np.max(bbox_coords[:, 0]),\\n"
+        "            )\\n"
+    )
+    return s.replace(needle, repl)
+
+patched = patch_file(p, patch_preprocess_bbox)
+print(f"Patched preprocess_image bbox robustness: {patched}")
+
+# 3) Empty sparse coords guard in run()
+guard_marker = "# trellis2-worker build patch: explicit empty sparse coords guard"
+def patch_empty_coords_guard(s: str) -> str:
+    if guard_marker in s:
+        return s
+    block = (
+        "        coords = self.sample_sparse_structure(\\n"
+        "            cond_512, ss_res,\\n"
+        "            num_samples, sparse_structure_sampler_params\\n"
+        "        )\\n"
+    )
+    if block not in s:
+        print("WARN: sample_sparse_structure block not found; skipping empty-coords guard patch")
+        return s
+    repl = (
+        block
+        + f"        {guard_marker}\\n"
+        + "        if coords.numel() == 0 or coords.shape[0] == 0:\\n"
+        + "            raise RuntimeError('empty sparse coords')\\n"
+    )
+    return s.replace(block, repl)
+
+patched = patch_file(p, patch_empty_coords_guard)
+print(f"Patched empty sparse coords guard: {patched}")
+
+# 4) O-Voxel postprocess: cleanup after remesh (the standard branch already does this)
+ov = root / "o-voxel" / "o_voxel" / "postprocess.py"
+ov_marker = "# trellis2-worker build patch: cleanup after remesh"
+def patch_ovoxel_cleanup(s: str) -> str:
+    if ov_marker in s:
+        return s
+    needle = "        mesh.simplify(decimation_target, verbose=verbose)\\n"
+    idx = s.find(needle)
+    if idx == -1:
+        print("WARN: o_voxel postprocess simplify needle not found; skipping remesh cleanup patch")
+        return s
+    insert = (
+        needle
+        + f"        {ov_marker}\\n"
+        + "        mesh.remove_duplicate_faces()\\n"
+        + "        mesh.repair_non_manifold_edges()\\n"
+        + "        mesh.remove_small_connected_components(1e-5)\\n"
+        + "        mesh.fill_holes(max_hole_perimeter=3e-2)\\n"
+        + "        mesh.unify_face_orientations()\\n"
+    )
+    return s.replace(needle, insert, 1)
+
+patched = patch_file(ov, patch_ovoxel_cleanup)
+print(f"Patched o_voxel remesh cleanup: {patched}")
+PY
+
 WORKDIR /app
 COPY requirements-docker.txt /app/requirements-docker.txt
 RUN pip install -r /app/requirements-docker.txt

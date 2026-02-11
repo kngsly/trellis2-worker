@@ -285,6 +285,14 @@ def _preprocess_images(pipe, images: List[Image.Image]) -> List[Image.Image]:
     return out
 
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        v = str(os.environ.get(name, "")).strip()
+        return float(v) if v else float(default)
+    except Exception:
+        return float(default)
+
+
 def _has_transparency(im: Image.Image) -> bool:
     try:
         if im.mode == "RGBA":
@@ -362,6 +370,128 @@ def _prepare_input_image(im: Image.Image) -> Image.Image:
     return im
 
 
+def _safe_alpha_bbox(alpha: np.ndarray, primary_thresh: float = 0.8) -> Optional[tuple[int, int, int, int]]:
+    """
+    Return bbox (x0,y0,x1,y1) inclusive for alpha mask.
+    Tries a high threshold first (matching upstream), then falls back to any non-zero alpha.
+    """
+    if alpha.ndim != 2:
+        return None
+    h, w = alpha.shape
+    if h <= 0 or w <= 0:
+        return None
+
+    def _bbox_for_thresh(t: float) -> Optional[tuple[int, int, int, int]]:
+        coords = np.argwhere(alpha > (t * 255.0))
+        if coords.size == 0:
+            return None
+        y0 = int(coords[:, 0].min())
+        y1 = int(coords[:, 0].max())
+        x0 = int(coords[:, 1].min())
+        x1 = int(coords[:, 1].max())
+        return (x0, y0, x1, y1)
+
+    bb = _bbox_for_thresh(float(primary_thresh))
+    if bb is None:
+        bb = _bbox_for_thresh(0.0)
+    return bb
+
+
+def _crop_square_around_bbox(
+    w: int,
+    h: int,
+    bbox_xyxy: tuple[int, int, int, int],
+    pad_px: int = 0,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bbox_xyxy
+    x0 = max(0, min(w - 1, int(x0)))
+    y0 = max(0, min(h - 1, int(y0)))
+    x1 = max(0, min(w - 1, int(x1)))
+    y1 = max(0, min(h - 1, int(y1)))
+
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    side = max(1, int(max(x1 - x0, y1 - y0)))
+    side = side + int(max(0, pad_px)) * 2
+
+    half = side // 2
+    left = int(round(cx - half))
+    top = int(round(cy - half))
+    right = left + side
+    bottom = top + side
+
+    left = max(0, min(w - 1, left))
+    top = max(0, min(h - 1, top))
+    right = max(left + 1, min(w, right))
+    bottom = max(top + 1, min(h, bottom))
+    return (left, top, right, bottom)  # PIL crop is (left, top, right, bottom) with right/bottom exclusive
+
+
+def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
+    """
+    Preprocess to match the official demo behavior, but with guardrails:
+    - Avoid empty bbox when alpha is soft/low.
+    - Optional padding around the alpha bbox.
+
+    Returns an RGB PIL image (alpha premultiplied like upstream).
+    """
+    # Downscale large inputs (matches upstream).
+    max_size = max(input_im.size) if input_im.size else 0
+    if max_size > 0:
+        scale = min(1.0, 1024.0 / float(max_size))
+        if scale < 1.0:
+            input_im = input_im.resize(
+                (max(1, int(input_im.width * scale)), max(1, int(input_im.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+
+    has_alpha = False
+    try:
+        if input_im.mode == "RGBA":
+            a = np.array(input_im)[:, :, 3]
+            if not np.all(a == 255):
+                has_alpha = True
+    except Exception:
+        has_alpha = False
+
+    # If no alpha, run RMBG to get an alpha matte.
+    if not has_alpha:
+        im_rgb = input_im.convert("RGB")
+        if getattr(pipe, "low_vram", False):
+            pipe.rembg_model.to(pipe.device)  # type: ignore[attr-defined]
+        out_rgba = pipe.rembg_model(im_rgb)  # type: ignore[attr-defined]
+        if getattr(pipe, "low_vram", False):
+            pipe.rembg_model.cpu()  # type: ignore[attr-defined]
+    else:
+        out_rgba = input_im.convert("RGBA")
+
+    out_np = np.array(out_rgba)
+    if out_np.ndim != 3 or out_np.shape[2] < 4:
+        # If RMBG returns unexpected format, just ensure RGB.
+        return out_rgba.convert("RGB")
+
+    alpha = out_np[:, :, 3]
+    thresh = _float_env("TRELLIS2_PREPROCESS_ALPHA_BBOX_THRESHOLD", 0.8)
+    pad_px = _int_env("TRELLIS2_PREPROCESS_PAD_PX", 8)
+    bb = _safe_alpha_bbox(alpha, primary_thresh=thresh)
+    if bb is None:
+        # Nothing to crop; return premultiplied RGB of the full image.
+        rgb = out_np[:, :, :3].astype(np.float32) / 255.0
+        a = alpha.astype(np.float32)[:, :, None] / 255.0
+        rgb = rgb * a
+        return Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
+
+    w, h = int(out_rgba.size[0]), int(out_rgba.size[1])
+    crop_box = _crop_square_around_bbox(w=w, h=h, bbox_xyxy=bb, pad_px=pad_px)
+    cropped = out_rgba.crop(crop_box)
+
+    cropped_np = np.array(cropped).astype(np.float32) / 255.0
+    rgb = cropped_np[:, :, :3]
+    a = cropped_np[:, :, 3:4]
+    rgb = rgb * a
+    return Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
+
+
 def _fuse_cond(cond_tensor):
     """
     Fuse per-image conditioning into a single prompt conditioning.
@@ -430,24 +560,24 @@ def generate_glb_from_image_bytes_list(
     t0 = time.time()
 
     pipe = _get_pipeline()
-    imgs = []
+    imgs_raw: List[Image.Image] = []
     for raw in images_bytes:
         if not raw:
             continue
         im = Image.open(io.BytesIO(raw))
-        im = _prepare_input_image(im)
-        imgs.append(im)
-    if not imgs:
+        # Keep a copy of the raw image (we'll decide preprocessing later).
+        imgs_raw.append(im)
+    if not imgs_raw:
         raise ValueError("empty image bytes")
 
     if backup_inputs:
         in_dir = out_dir / "inputs"
         in_dir.mkdir(parents=True, exist_ok=True)
-        for idx, (raw, im) in enumerate(zip(images_bytes, imgs)):
+        for idx, (raw, im) in enumerate(zip(images_bytes, imgs_raw)):
             try:
                 # Prefer PNG to keep alpha if present.
                 p = in_dir / f"{uuid.uuid4().hex}_{idx+1:02d}.png"
-                im.save(str(p), format="PNG")
+                _prepare_input_image(im).save(str(p), format="PNG")
             except Exception:
                 pass
 
@@ -461,7 +591,7 @@ def generate_glb_from_image_bytes_list(
     import o_voxel  # type: ignore
 
     ptype = _resolve_pipeline_type(pipeline_type)
-    img0 = imgs[0]
+    img0_raw = imgs_raw[0]
 
     import torch
 
@@ -469,8 +599,14 @@ def generate_glb_from_image_bytes_list(
     if seed is None:
         seed = _int_env("TRELLIS2_DEFAULT_SEED", 42)
 
+    # Decide preprocessing policy once, and then run `pipe.run(..., preprocess_image=False)`
+    # to match the official demo (preprocess stage is explicit, sampling stage is pure).
+    do_preprocess = _bool_env("TRELLIS2_PREPROCESS_IMAGE", True) if preprocess_image is None else bool(preprocess_image)
+    primary_img = _safe_preprocess_image(pipe, img0_raw) if do_preprocess else _prepare_input_image(img0_raw).convert("RGB")
+    fallback_img = _prepare_input_image(img0_raw).convert("RGB") if do_preprocess else None
+
     # Pass only kwargs supported by this pipeline version.
-    kwargs = {}
+    kwargs: dict = {}
     try:
         sig = inspect.signature(pipe.run)  # type: ignore[attr-defined]
         if "seed" in sig.parameters:
@@ -480,10 +616,30 @@ def generate_glb_from_image_bytes_list(
         if "num_samples" in sig.parameters:
             kwargs["num_samples"] = 1
         if "preprocess_image" in sig.parameters:
-            if preprocess_image is None:
-                kwargs["preprocess_image"] = _bool_env("TRELLIS2_PREPROCESS_IMAGE", True)
-            else:
-                kwargs["preprocess_image"] = bool(preprocess_image)
+            kwargs["preprocess_image"] = False
+        # HF demo defaults (app.py): pass explicit sampler params rather than relying on pipeline.json.
+        if _bool_env("TRELLIS2_USE_DEMO_SAMPLER_DEFAULTS", True):
+            if "sparse_structure_sampler_params" in sig.parameters:
+                kwargs["sparse_structure_sampler_params"] = {
+                    "steps": _int_env("TRELLIS2_SS_STEPS", 12),
+                    "guidance_strength": _float_env("TRELLIS2_SS_GUIDANCE_STRENGTH", 7.5),
+                    "guidance_rescale": _float_env("TRELLIS2_SS_GUIDANCE_RESCALE", 0.7),
+                    "rescale_t": _float_env("TRELLIS2_SS_RESCALE_T", 5.0),
+                }
+            if "shape_slat_sampler_params" in sig.parameters:
+                kwargs["shape_slat_sampler_params"] = {
+                    "steps": _int_env("TRELLIS2_SHAPE_STEPS", 12),
+                    "guidance_strength": _float_env("TRELLIS2_SHAPE_GUIDANCE_STRENGTH", 7.5),
+                    "guidance_rescale": _float_env("TRELLIS2_SHAPE_GUIDANCE_RESCALE", 0.5),
+                    "rescale_t": _float_env("TRELLIS2_SHAPE_RESCALE_T", 3.0),
+                }
+            if "tex_slat_sampler_params" in sig.parameters:
+                kwargs["tex_slat_sampler_params"] = {
+                    "steps": _int_env("TRELLIS2_TEX_STEPS", 12),
+                    "guidance_strength": _float_env("TRELLIS2_TEX_GUIDANCE_STRENGTH", 1.0),
+                    "guidance_rescale": _float_env("TRELLIS2_TEX_GUIDANCE_RESCALE", 0.0),
+                    "rescale_t": _float_env("TRELLIS2_TEX_RESCALE_T", 3.0),
+                }
     except Exception:
         # If signature inspection fails, still attempt a minimal call.
         kwargs["seed"] = int(seed)
@@ -493,18 +649,19 @@ def generate_glb_from_image_bytes_list(
     # Retry on empty sparse sampling by shifting the seed.
     def _is_empty_sparse_error(exc: BaseException) -> bool:
         msg = (str(exc) or "").lower()
-        return ("input.numel() == 0" in msg) or ("max(): expected reduction dim" in msg)
+        return ("input.numel() == 0" in msg) or ("max(): expected reduction dim" in msg) or ("empty sparse coords" in msg)
 
     retries = _int_env("TRELLIS2_EMPTY_SPARSE_RETRIES", 4)
     last_err: Optional[BaseException] = None
 
-    # Some inputs get wiped out by TRELLIS preprocessing (background removal + crop), which can
-    # lead to empty sparse coords. If that happens, we auto-fallback by toggling preprocess_image.
-    preprocess_toggle_attempted = False
-    base_preprocess = kwargs.get("preprocess_image", None)
+    # Some inputs get wiped out by preprocessing (background removal + crop), which can
+    # lead to empty sparse coords. If that happens, we auto-fallback by switching to a
+    # less destructive input variant once.
+    input_fallback_attempted = False
 
     attempt = 0
     max_attempts = max(1, retries)
+    img0 = primary_img
     while True:
         try:
             torch.manual_seed(int(seed) + attempt)
@@ -524,11 +681,11 @@ def generate_glb_from_image_bytes_list(
             if attempt < max_attempts:
                 continue
 
-            # If we exhausted seed-shift retries, flip preprocess_image once and try again.
-            if (not preprocess_toggle_attempted) and ("preprocess_image" in kwargs):
-                preprocess_toggle_attempted = True
+            # If we exhausted seed-shift retries, switch input once and try again.
+            if (not input_fallback_attempted) and (fallback_img is not None):
+                input_fallback_attempted = True
                 attempt = 0
-                kwargs["preprocess_image"] = (not bool(base_preprocess))
+                img0 = fallback_img
                 continue
 
             raise RuntimeError("pipeline.run() failed after retries") from last_err
