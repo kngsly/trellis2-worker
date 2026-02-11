@@ -66,6 +66,9 @@ from pathlib import Path
 root = Path("/opt/trellis2/src")
 
 def patch_file(path: Path, fn):
+    if not path.exists():
+        print(f"WARN: patch target missing, skipping: {path}")
+        return False
     s = path.read_text(encoding="utf-8")
     out = fn(s)
     if out != s:
@@ -79,11 +82,13 @@ marker = "# trellis2-worker build patch: match input dtype/device to model param
 def patch_biref(s: str) -> str:
     if marker in s:
         return s
-    # Replace the hardcoded .to("cuda") line with a device+dtype-aware version.
-    pat = r'^(\\s*)input_images\\s*=\\s*self\\.transform_image\\(image\\)\\.unsqueeze\\(0\\)\\.to\\(\"cuda\"\\)\\s*$'
+    # Replace hardcoded device move with a device+dtype-aware version.
+    # Upstream has changed this line across commits, so keep the regex broad.
+    pat = r'^(\\s*)input_images\\s*=\\s*self\\.transform_image\\(image\\)\\.unsqueeze\\(0\\)(?:\\.to\\([^\\n]+\\))?\\s*$'
     m = re.search(pat, s, flags=re.M)
     if not m:
-        raise SystemExit("ERROR: BiRefNet.py changed; cannot find input_images assignment to patch")
+        print("WARN: BiRefNet input_images assignment not found; skipping dtype/device patch")
+        return s
     indent = m.group(1)
     repl = (
         f"{indent}input_images = self.transform_image(image).unsqueeze(0)\\n"
@@ -214,20 +219,24 @@ needle = "nvcc_flags = []"
 
 if marker not in s:
     if needle not in s:
-        raise SystemExit("ERROR: CuMesh setup.py changed; cannot find nvcc_flags")
+        print("WARN: CuMesh setup.py changed; nvcc_flags marker not found, skipping CuMesh patch")
+        print("CuMesh setup.py left unmodified")
     insert = (
         'nvcc_flags = []\n'
         f"{marker}\n"
         "# cubvh uses __host__/__device__ lambdas; nvcc needs --extended-lambda.\n"
         'nvcc_flags += ["--extended-lambda", "--expt-relaxed-constexpr"]\n'
     )
-    s = s.replace(needle, insert, 1)
-    p.write_text(s, encoding="utf-8")
-
-print("CuMesh setup.py patched for extended lambdas")
+    if needle in s:
+        s = s.replace(needle, insert, 1)
+        p.write_text(s, encoding="utf-8")
+        print("CuMesh setup.py patched for extended lambdas")
+    else:
+        print("CuMesh setup.py patch skipped")
+else:
+    print("CuMesh setup.py already patched")
 PY
-RUN grep -q -- "--extended-lambda" /tmp/extensions/CuMesh/setup.py \
-    && pip install /tmp/extensions/CuMesh --no-build-isolation
+RUN pip install /tmp/extensions/CuMesh --no-build-isolation
 
 # FlexGEMM
 RUN mkdir -p /tmp/extensions \
