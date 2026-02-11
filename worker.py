@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 import uuid
+import ctypes
 from pathlib import Path
 from typing import List, Optional
 
@@ -28,10 +29,109 @@ _READY = {
     "ready_at": 0.0,
 }
 _READY_LOCK = threading.Lock()
+_CUDA_RUNTIME_PREPARED = False
 
 
 def _get_device():
     return os.environ.get("TRELLIS2_DEVICE", "cuda")
+
+
+def _prepend_env_path(name: str, value: str) -> None:
+    value = str(value or "").strip()
+    if not value:
+        return
+    current = str(os.environ.get(name, "")).strip()
+    parts = [p for p in current.split(":") if p]
+    if value in parts:
+        return
+    os.environ[name] = f"{value}:{current}" if current else value
+
+
+def _ensure_cuda_linker_paths() -> None:
+    """
+    Best-effort runtime repair for hosts where libcuda is mounted only as libcuda.so.1.
+    Triton/flex_gemm compiles helper modules with `-lcuda` and needs libcuda.so visible.
+    """
+    global _CUDA_RUNTIME_PREPARED
+    if _CUDA_RUNTIME_PREPARED:
+        return
+    _CUDA_RUNTIME_PREPARED = True
+
+    if _get_device().lower() != "cuda":
+        return
+
+    # If libcuda.so already resolves, nothing to do.
+    try:
+        ctypes.CDLL("libcuda.so")
+        return
+    except Exception:
+        pass
+
+    candidate_patterns = (
+        "/usr/lib/x86_64-linux-gnu/libcuda.so*",
+        "/lib/x86_64-linux-gnu/libcuda.so*",
+        "/usr/lib64/libcuda.so*",
+        "/usr/local/nvidia/lib64/libcuda.so*",
+        "/usr/local/cuda/compat/libcuda.so*",
+        "/usr/lib/wsl/lib/libcuda.so*",
+    )
+    candidates = []
+    for pat in candidate_patterns:
+        try:
+            candidates.extend(Path("/").glob(pat.lstrip("/")))
+        except Exception:
+            continue
+
+    # Prefer an actual linker name first, then .so.1.
+    preferred = None
+    for p in candidates:
+        if p.name == "libcuda.so" and p.exists():
+            preferred = p
+            break
+    if preferred is None:
+        for p in candidates:
+            if p.name.startswith("libcuda.so.") and p.exists():
+                preferred = p
+                break
+
+    if preferred is None:
+        print("[worker] cuda-preflight: libcuda not found in known paths", flush=True)
+        return
+
+    link_path = preferred
+    if preferred.name != "libcuda.so":
+        # Try to create sibling linker name if writable; otherwise create in /tmp/libcuda.
+        sibling = preferred.with_name("libcuda.so")
+        if sibling.exists():
+            link_path = sibling
+        else:
+            created = None
+            try:
+                sibling.symlink_to(preferred.name)
+                created = sibling
+            except Exception:
+                try:
+                    tmp_dir = Path("/tmp/libcuda")
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+                    tmp_link = tmp_dir / "libcuda.so"
+                    if tmp_link.exists() or tmp_link.is_symlink():
+                        tmp_link.unlink()
+                    tmp_link.symlink_to(preferred)
+                    created = tmp_link
+                except Exception:
+                    created = None
+            if created is not None:
+                link_path = created
+
+    _prepend_env_path("LIBRARY_PATH", str(link_path.parent))
+    _prepend_env_path("LD_LIBRARY_PATH", str(link_path.parent))
+    os.environ.setdefault("TRITON_LIBCUDA_PATH", str(link_path.parent))
+
+    try:
+        ctypes.CDLL("libcuda.so")
+        print(f"[worker] cuda-preflight: using {link_path}", flush=True)
+    except Exception as e:
+        print(f"[worker] cuda-preflight: libcuda still unresolved ({e})", flush=True)
 
 
 def _lazy_import_pipeline():
@@ -195,6 +295,8 @@ def _get_pipeline():
     global _PIPELINE
     if _PIPELINE is not None:
         return _PIPELINE
+
+    _ensure_cuda_linker_paths()
 
     with _READY_LOCK:
         if _READY["status"] == "not_started":
