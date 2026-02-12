@@ -706,6 +706,7 @@ def generate_glb_from_image_bytes_list(
     seed: Optional[int] = None,
     pipeline_type: Optional[str] = None,
     preprocess_image: Optional[bool] = None,
+    post_scale_z: Optional[float] = None,
     backup_inputs: bool = True,
 ) -> Path:
     if not images_bytes:
@@ -864,6 +865,18 @@ def generate_glb_from_image_bytes_list(
         verbose=True,
     )
 
+    # Optional post-export axis scaling. This is intentionally Z-only so callers can
+    # compensate for known vertical squash without touching X/Y proportions.
+    scale_z = _float_env("TRELLIS2_POST_SCALE_Z", 1.0) if post_scale_z is None else float(post_scale_z)
+    if not np.isfinite(scale_z) or scale_z <= 0:
+        scale_z = 1.0
+    if abs(scale_z - 1.0) > 1e-6:
+        glb.apply_scale([1.0, 1.0, float(scale_z)])
+        try:
+            glb.fix_normals()
+        except Exception:
+            pass
+
     out_path = out_dir / f"{uid}.glb"
     # Blender compatibility: many installs do not decode embedded WebP textures.
     # Default to PNG; enable WebP explicitly if you want smaller files.
@@ -873,7 +886,7 @@ def generate_glb_from_image_bytes_list(
     dt = time.time() - t0
     print(
         f"[worker] generated {out_path} in {dt:.1f}s "
-        f"(inputs={len(images_bytes)} low_poly={low_poly} pipeline_type={ptype})",
+        f"(inputs={len(images_bytes)} low_poly={low_poly} pipeline_type={ptype} post_scale_z={scale_z:.4f})",
         flush=True,
     )
     return out_path

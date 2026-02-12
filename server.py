@@ -63,6 +63,28 @@ def _parse_bool(v: Optional[str], default: bool = False) -> bool:
     return default
 
 
+def _parse_float(
+    v: Optional[str],
+    default: Optional[float] = None,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> Optional[float]:
+    if v is None:
+        return default
+    s = str(v).strip()
+    if not s:
+        return default
+    try:
+        x = float(s)
+    except Exception:
+        return default
+    if min_value is not None and x < min_value:
+        x = float(min_value)
+    if max_value is not None and x > max_value:
+        x = float(max_value)
+    return x
+
+
 @app.post("/generate")
 async def generate(
     image: Optional[UploadFile] = File(None),
@@ -71,12 +93,14 @@ async def generate(
     seed: Optional[str] = Form(None),
     pipeline_type: Optional[str] = Form(None),
     preprocess_image: Optional[str] = Form(None),
+    post_scale_z: Optional[str] = Form(None),
     backup_inputs: Optional[str] = Form(None),
 ):
     try:
         want_low_poly = _parse_bool(low_poly, default=False)
         want_backup = _parse_bool(backup_inputs, default=True)
         want_preprocess = _parse_bool(preprocess_image, default=True) if preprocess_image is not None else None
+        want_post_scale_z = _parse_float(post_scale_z, default=None, min_value=0.01, max_value=8.0)
         safe_seed = None
         if seed is not None and str(seed).strip():
             try:
@@ -109,6 +133,7 @@ async def generate(
             seed=safe_seed,
             pipeline_type=str(pipeline_type).strip() if pipeline_type else None,
             preprocess_image=want_preprocess,
+            post_scale_z=want_post_scale_z,
             backup_inputs=want_backup,
         )
         return JSONResponse({"success": True, "glb_path": str(out_path)}, status_code=200)
