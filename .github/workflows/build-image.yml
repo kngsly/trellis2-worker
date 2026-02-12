@@ -10,7 +10,7 @@ on:
       push_latest:
         description: "Also push :latest"
         required: false
-        default: false
+        default: true
         type: boolean
 
 jobs:
@@ -53,7 +53,14 @@ jobs:
         run: |
           set -euo pipefail
           TAGS="kngsly/trellis2-worker:${{ inputs.image_tag }}"$'\n'"kngsly/trellis2-worker:sha-${{ steps.sha.outputs.short_sha }}"
+          SHOULD_PUSH_LATEST="false"
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            SHOULD_PUSH_LATEST="true"
+          fi
           if [[ "${{ inputs.push_latest }}" == "true" ]]; then
+            SHOULD_PUSH_LATEST="true"
+          fi
+          if [[ "$SHOULD_PUSH_LATEST" == "true" ]]; then
             TAGS="$TAGS"$'\n'"kngsly/trellis2-worker:latest"
           fi
           echo "tags<<EOF" >> "$GITHUB_OUTPUT"
