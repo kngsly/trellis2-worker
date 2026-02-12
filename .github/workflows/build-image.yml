@@ -1,6 +1,8 @@
 name: Build Worker Image
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       image_tag:
@@ -52,13 +54,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAGS="kngsly/trellis2-worker:${{ inputs.image_tag }}"$'\n'"kngsly/trellis2-worker:sha-${{ steps.sha.outputs.short_sha }}"
-          SHOULD_PUSH_LATEST="false"
-          if [[ "${{ github.ref_name }}" == "main" ]]; then
-            SHOULD_PUSH_LATEST="true"
-          fi
-          if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            SHOULD_PUSH_LATEST="true"
+          SHORT_SHA="${{ steps.sha.outputs.short_sha }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAGS="kngsly/trellis2-worker:${{ inputs.image_tag }}"$'\n'"kngsly/trellis2-worker:sha-$SHORT_SHA"
+            SHOULD_PUSH_LATEST="false"
+            [[ "${{ github.ref_name }}" == "main" ]] && SHOULD_PUSH_LATEST="true"
+            [[ "${{ inputs.push_latest }}" == "true" ]] && SHOULD_PUSH_LATEST="true"
+          else
+            TAGS="kngsly/trellis2-worker:sha-$SHORT_SHA"
+            SHOULD_PUSH_LATEST="false"
+            [[ "${{ github.ref_name }}" == "main" ]] && SHOULD_PUSH_LATEST="true"
           fi
           if [[ "$SHOULD_PUSH_LATEST" == "true" ]]; then
             TAGS="$TAGS"$'\n'"kngsly/trellis2-worker:latest"
