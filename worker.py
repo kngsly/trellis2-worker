@@ -529,6 +529,15 @@ def _crop_square_around_bbox(
     return (left, top, right, bottom)  # PIL crop is (left, top, right, bottom) with right/bottom exclusive
 
 
+def _is_rembg_dtype_mismatch(exc: BaseException) -> bool:
+    s = (str(exc) or "").lower()
+    if "input type" in s and "bias type" in s and ("c10::half" in s or "half" in s):
+        return True
+    if "input type" in s and "weight type" in s and "half" in s:
+        return True
+    return False
+
+
 def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
     """
     Preprocess to match the official demo behavior, but with guardrails:
@@ -559,11 +568,55 @@ def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
     # If no alpha, run RMBG to get an alpha matte.
     if not has_alpha:
         im_rgb = input_im.convert("RGB")
-        if getattr(pipe, "low_vram", False):
-            pipe.rembg_model.to(pipe.device)  # type: ignore[attr-defined]
-        out_rgba = pipe.rembg_model(im_rgb)  # type: ignore[attr-defined]
-        if getattr(pipe, "low_vram", False):
-            pipe.rembg_model.cpu()  # type: ignore[attr-defined]
+        low_vram = bool(getattr(pipe, "low_vram", False))
+        rembg_model = getattr(pipe, "rembg_model", None)
+        if rembg_model is None:
+            out_rgba = im_rgb.convert("RGBA")
+        else:
+            if low_vram:
+                try:
+                    rembg_model.to(pipe.device)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+            try:
+                out_rgba = rembg_model(im_rgb)  # type: ignore[attr-defined]
+            except Exception as e:
+                # HuggingFace remote updates can change BiRefNet runtime behavior and trigger
+                # float/half dtype mismatches at inference time. Retry once with model.float().
+                if _is_rembg_dtype_mismatch(e):
+                    print(
+                        "[worker] rembg: dtype mismatch during preprocess; retrying with rembg model forced to float32",
+                        flush=True,
+                    )
+                    try:
+                        rembg_model.float()  # type: ignore[attr-defined]
+                        if low_vram:
+                            rembg_model.to(pipe.device)  # type: ignore[attr-defined]
+                        out_rgba = rembg_model(im_rgb)  # type: ignore[attr-defined]
+                    except Exception as e2:
+                        if _bool_env("TRELLIS2_PREPROCESS_DISABLE_REMBG_ON_ERROR", True):
+                            print(
+                                f"[worker] rembg: retry failed ({e2}); continuing without rembg preprocessing",
+                                flush=True,
+                            )
+                            out_rgba = im_rgb.convert("RGBA")
+                        else:
+                            raise
+                elif _bool_env("TRELLIS2_PREPROCESS_DISABLE_REMBG_ON_ERROR", True):
+                    print(
+                        f"[worker] rembg: preprocess failed ({e}); continuing without rembg preprocessing",
+                        flush=True,
+                    )
+                    out_rgba = im_rgb.convert("RGBA")
+                else:
+                    raise
+            finally:
+                if low_vram:
+                    try:
+                        rembg_model.cpu()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
     else:
         out_rgba = input_im.convert("RGBA")
 
