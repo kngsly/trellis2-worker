@@ -8,6 +8,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    CUDA_MODULE_LOADING=LAZY \
     # Helps reduce fragmentation on long-running jobs.
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     OPENCV_IO_ENABLE_OPENEXR=1 \

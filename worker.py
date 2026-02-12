@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
 import threading
 import time
 import traceback
@@ -132,6 +133,86 @@ def _ensure_cuda_linker_paths() -> None:
         print(f"[worker] cuda-preflight: using {link_path}", flush=True)
     except Exception as e:
         print(f"[worker] cuda-preflight: libcuda still unresolved ({e})", flush=True)
+
+
+def _is_probably_driver_runtime_error(exc: BaseException) -> bool:
+    s = str(exc or "").lower()
+    if not s:
+        return False
+    markers = (
+        "0 active drivers",
+        "cuda driver",
+        "cuda initialization error",
+        "cuda unknown error",
+        "forward compatibility was attempted on non supported hw",
+        "libcuda",
+    )
+    return any(m in s for m in markers)
+
+
+def _cuda_runtime_probe() -> tuple[bool, str]:
+    # 1) Device nodes present.
+    if not (Path("/dev/nvidiactl").exists() and Path("/dev/nvidia-uvm").exists()):
+        return (False, "missing /dev/nvidiactl or /dev/nvidia-uvm")
+
+    # 2) Driver linker name resolves.
+    try:
+        ctypes.CDLL("libcuda.so")
+    except Exception as e:
+        return (False, f"libcuda unresolved ({e})")
+
+    # 3) nvidia-smi reports at least one GPU (best effort).
+    try:
+        p = subprocess.run(
+            ["nvidia-smi", "-L"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        out = (p.stdout or "").strip()
+        if p.returncode != 0 or "GPU " not in out:
+            err = (p.stderr or "").strip()
+            return (False, f"nvidia-smi not ready rc={p.returncode} out={out[:140]!r} err={err[:140]!r}")
+    except Exception as e:
+        return (False, f"nvidia-smi probe failed ({e})")
+
+    # 4) Torch sees CUDA (defer heavy imports until needed).
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return (False, "torch.cuda.is_available()=False")
+        if int(torch.cuda.device_count()) <= 0:
+            return (False, "torch.cuda.device_count()=0")
+    except Exception as e:
+        return (False, f"torch cuda probe failed ({e})")
+
+    return (True, "cuda runtime ready")
+
+
+def _wait_for_cuda_runtime_ready() -> None:
+    if _get_device().lower() != "cuda":
+        return
+    max_wait_sec = int(os.environ.get("TRELLIS2_CUDA_READY_TIMEOUT_SEC", "90") or "90")
+    interval_sec = max(1, int(os.environ.get("TRELLIS2_CUDA_READY_POLL_SEC", "3") or "3"))
+    deadline = time.time() + max(1, max_wait_sec)
+    last_detail = ""
+
+    while True:
+        ok, detail = _cuda_runtime_probe()
+        if ok:
+            if last_detail:
+                print(f"[worker] cuda-preflight: recovered ({detail})", flush=True)
+            return
+        last_detail = detail
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"CUDA runtime did not become ready within {max_wait_sec}s: {detail}"
+            )
+        print(f"[worker] cuda-preflight: waiting ({detail})", flush=True)
+        time.sleep(interval_sec)
 
 
 def _lazy_import_pipeline():
@@ -297,6 +378,7 @@ def _get_pipeline():
         return _PIPELINE
 
     _ensure_cuda_linker_paths()
+    _wait_for_cuda_runtime_ready()
 
     with _READY_LOCK:
         if _READY["status"] == "not_started":
@@ -307,24 +389,41 @@ def _get_pipeline():
     model_id = os.environ.get("TRELLIS2_MODEL_ID", "microsoft/TRELLIS.2-4B")
     Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
 
-    try:
-        if _should_avoid_gated_deps():
-            pipe = _build_pipeline_with_image_cond_override(model_id)
-        elif _should_avoid_gated_rembg_deps():
-            pipe = _build_pipeline_with_rembg_override(model_id)
-        else:
-            pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
-    except Exception as e:
-        # If the upstream config points at a gated model, fall back to a non-gated alternative.
-        if _is_gated_repo_error(e):
+    retries = max(1, int(os.environ.get("TRELLIS2_DRIVER_RETRY_ATTEMPTS", "4") or "4"))
+    retry_sleep_sec = max(1, int(os.environ.get("TRELLIS2_DRIVER_RETRY_SLEEP_SEC", "8") or "8"))
+    last_err = None
+
+    for attempt in range(1, retries + 1):
+        try:
             if _should_avoid_gated_deps():
                 pipe = _build_pipeline_with_image_cond_override(model_id)
             elif _should_avoid_gated_rembg_deps():
                 pipe = _build_pipeline_with_rembg_override(model_id)
             else:
-                raise
-        else:
+                pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
+            break
+        except Exception as e:
+            last_err = e
+            # If the upstream config points at a gated model, fall back to a non-gated alternative.
+            if _is_gated_repo_error(e):
+                if _should_avoid_gated_deps():
+                    pipe = _build_pipeline_with_image_cond_override(model_id)
+                elif _should_avoid_gated_rembg_deps():
+                    pipe = _build_pipeline_with_rembg_override(model_id)
+                else:
+                    raise
+                break
+            if attempt < retries and _is_probably_driver_runtime_error(e):
+                print(
+                    f"[worker] preload: driver/runtime not ready (attempt {attempt}/{retries}): {e}",
+                    flush=True,
+                )
+                _ensure_cuda_linker_paths()
+                time.sleep(retry_sleep_sec)
+                continue
             raise
+    else:
+        raise RuntimeError(f"Pipeline init retries exhausted: {last_err}")
     dev = _get_device()
     if dev == "cuda":
         pipe.cuda()
