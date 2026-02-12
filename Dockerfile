@@ -20,7 +20,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # Avoid OOM during extension builds (ninja/cmake/setuptools often respect these).
     MAX_JOBS=${BUILD_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
-    NINJAFLAGS=-j${BUILD_JOBS}
+    NINJAFLAGS=-j${BUILD_JOBS} \
+    # Prefer CUDA forward-compat runtime libs when host driver/runtime mismatch occurs.
+    LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3.10 python3.10-venv python3.10-dev python3-pip \
@@ -28,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ninja-build pkg-config \
       libgl1-mesa-glx libglib2.0-0 libsm6 libxrender1 libxext6 \
       libjpeg-dev \
+      cuda-compat-12-4 \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
