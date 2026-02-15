@@ -96,6 +96,7 @@ async def generate(
     post_scale_z: Optional[str] = Form(None),
     backup_inputs: Optional[str] = Form(None),
 ):
+    export_meta: dict = {}
     try:
         want_low_poly = _parse_bool(low_poly, default=False)
         want_backup = _parse_bool(backup_inputs, default=True)
@@ -135,13 +136,20 @@ async def generate(
             preprocess_image=want_preprocess,
             post_scale_z=want_post_scale_z,
             backup_inputs=want_backup,
+            export_meta=export_meta,
         )
-        return JSONResponse({"success": True, "glb_path": str(out_path)}, status_code=200)
+        resp = {"success": True, "glb_path": str(out_path)}
+        if export_meta:
+            resp["worker_export"] = export_meta
+        return JSONResponse(resp, status_code=200)
     except Exception:
         tb = traceback.format_exc()
         if len(tb) > 20000:
             tb = tb[:20000] + "\n...[truncated]...\n"
-        return JSONResponse({"success": False, "error": tb}, status_code=200)
+        resp = {"success": False, "error": tb}
+        if export_meta:
+            resp["worker_export"] = export_meta
+        return JSONResponse(resp, status_code=200)
 
 
 @app.get("/download/{filename}")

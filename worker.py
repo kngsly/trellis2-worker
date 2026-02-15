@@ -833,7 +833,7 @@ def _int_env(name: str, default: int) -> int:
 def _choose_export_params(low_poly: bool):
     if low_poly:
         return (
-            _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 250000),
+            _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 150000),
             _int_env("TRELLIS2_TEXTURE_SIZE_LOW_POLY", 2048),
         )
     return (
@@ -851,6 +851,7 @@ def generate_glb_from_image_bytes_list(
     preprocess_image: Optional[bool] = None,
     post_scale_z: Optional[float] = None,
     backup_inputs: bool = True,
+    export_meta: Optional[dict] = None,
 ) -> Path:
     if not images_bytes:
         raise ValueError("empty upload")
@@ -992,13 +993,29 @@ def generate_glb_from_image_bytes_list(
                 raise RuntimeError("pipeline.run() failed after retries") from last_err
 
         # Export to GLB via o-voxel postprocess util.
+        # Free VRAM from pipeline run before mesh.simplify (CuMesh uses substantial VRAM).
+        _cuda_empty_cache()
         # On CUDA OOM during mesh.simplify, retry with lower decimation to stay within VRAM.
         decimation_target, texture_size = _choose_export_params(low_poly)
+        decimation_initial = int(decimation_target)
         uid = uuid.uuid4().hex
-        dec_min = _int_env("TRELLIS2_DECIMATION_MIN_OOM_FALLBACK", 50000)
+        dec_min = _int_env("TRELLIS2_DECIMATION_MIN_OOM_FALLBACK", 25000)
         glb = None
         last_glb_err = None
-        for attempt in range(_int_env("TRELLIS2_TO_GLB_OOM_RETRIES", 3)):
+        oom_retries = 0
+        to_glb_attempts = 0
+
+        if export_meta is not None:
+            export_meta.update({
+                "pipeline_type": ptype,
+                "low_poly": low_poly,
+                "texture_size": int(texture_size),
+                "decimation_initial": decimation_initial,
+                "input_image_count": len(images_bytes),
+            })
+
+        for attempt in range(_int_env("TRELLIS2_TO_GLB_OOM_RETRIES", 4)):
+            to_glb_attempts = attempt + 1
             try:
                 glb = o_voxel.postprocess.to_glb(
                     vertices=mesh.vertices,
@@ -1018,7 +1035,8 @@ def generate_glb_from_image_bytes_list(
                 break
             except RuntimeError as e:
                 last_glb_err = e
-                if _is_cuda_oom(e) and attempt < 2 and decimation_target > dec_min:
+                if _is_cuda_oom(e) and attempt < 3 and decimation_target > dec_min:
+                    oom_retries += 1
                     _cuda_empty_cache()
                     decimation_target = max(dec_min, decimation_target // 2)
                     print(
@@ -1026,9 +1044,31 @@ def generate_glb_from_image_bytes_list(
                         flush=True,
                     )
                     continue
+                if export_meta is not None:
+                    export_meta.update({
+                        "oom_exhausted": True,
+                        "oom_retries": oom_retries,
+                        "to_glb_attempts": to_glb_attempts,
+                        "decimation_final": int(decimation_target),
+                        "error_snippet": (str(e) or "")[:500],
+                    })
                 raise
         if glb is None:
+            if export_meta is not None:
+                export_meta.update({
+                    "oom_exhausted": True,
+                    "oom_retries": oom_retries,
+                    "to_glb_attempts": to_glb_attempts,
+                    "decimation_final": int(decimation_target),
+                })
             raise RuntimeError("to_glb failed") from last_glb_err
+
+        if export_meta is not None:
+            export_meta.update({
+                "oom_retries": oom_retries,
+                "to_glb_attempts": to_glb_attempts,
+                "decimation_final": int(decimation_target),
+            })
 
         # Optional post-export axis scaling. This is intentionally Z-only so callers can
         # compensate for known vertical squash without touching X/Y proportions.
