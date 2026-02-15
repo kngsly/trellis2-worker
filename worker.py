@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import io
+import logging
 import os
 import subprocess
 import sys
@@ -19,6 +20,12 @@ import uuid
 import ctypes
 from pathlib import Path
 from typing import List, Optional
+
+_log = logging.getLogger(__name__)
+
+# Minimum wait before exiting for "CUDA unavailable" or preload timeout (robustness:
+# avoid early exit on slow driver bring-up or slow first-time model download).
+_MIN_STARTUP_WAIT_SEC = 360  # 6 minutes
 
 
 def _is_cuda_oom(error: Exception) -> bool:
@@ -114,40 +121,52 @@ def _cuda_failure_diagnostics() -> None:
         print(line, flush=True)
 
 
-def assert_cuda_available_or_exit() -> None:
+def _wait_for_cuda(grace_sec: int) -> bool:
     """
-    Single entrypoint CUDA check when TRELLIS2_DEVICE=cuda. Optional bounded grace
-    period (CUDA_PREFLIGHT_GRACE_SEC, default 5, min 0 max 30). If CUDA remains
-    unavailable after grace, print FATAL diagnostics and sys.exit(1) so rent.py
-    can kill and retry on a different host/image.
+    Wait up to grace_sec for CUDA to become available (TRELLIS2_DEVICE=cuda only).
+    Returns True if CUDA is available, False otherwise. Never exits the process;
+    caller (e.g. preload worker) should set error state and continue serving /ready.
     """
     if _get_device().lower() != "cuda":
-        return
-    raw = str(os.environ.get("CUDA_PREFLIGHT_GRACE_SEC", "5") or "5").strip()
-    try:
-        grace_sec = max(0, min(30, int(raw)))
-    except ValueError:
-        grace_sec = 5
+        _log.info("CUDA preflight skipped (TRELLIS2_DEVICE!=cuda)")
+        return True
+    _log.info(
+        "CUDA preflight waiting up to %s s for device (min %s s for robustness)",
+        grace_sec,
+        _MIN_STARTUP_WAIT_SEC,
+    )
     deadline = time.time() + grace_sec
+    last_log = 0.0
+    log_interval = 60.0
 
     while time.time() < deadline:
         try:
             import torch
             if torch.cuda.is_available() and torch.cuda.device_count() > 0:
                 try:
-                    torch.cuda.get_device_name(0)
-                    return
+                    name = torch.cuda.get_device_name(0)
+                    _log.info("CUDA preflight ok: %s", name)
+                    return True
                 except Exception:
                     pass
         except ImportError:
             pass
-        if time.time() + 1.0 > deadline:
+        now = time.time()
+        if now - last_log >= log_interval:
+            remaining = max(0, int(deadline - now))
+            _log.info("CUDA preflight still waiting for device (~%s s remaining)", remaining)
+            last_log = now
+        if now + 1.0 > deadline:
             break
         time.sleep(1.0)
 
-    print("FATAL: CUDA not available after preflight grace; exiting with diagnostics.", flush=True)
+    _log.error(
+        "CUDA not available after %s s grace; setting error state (no exit)",
+        grace_sec,
+    )
+    print("CUDA not available after preflight grace; see diagnostics below (process continues).", flush=True)
     _cuda_failure_diagnostics()
-    sys.exit(1)
+    return False
 
 
 def _prepend_env_path(name: str, value: str) -> None:
@@ -440,7 +459,7 @@ def _get_pipeline(deadline: Optional[float] = None):
     if _PIPELINE is not None:
         return _PIPELINE
 
-    # CUDA must already have been confirmed by assert_cuda_available_or_exit() at server startup.
+    # CUDA is checked in _preload_worker via _wait_for_cuda before we load the pipeline.
     _ensure_cuda_linker_paths()
 
     if _bool_env("TRELLIS2_DISABLE_TRITON", False):
@@ -547,11 +566,25 @@ def _preload_heartbeat(interval_sec: float, started_at: float) -> None:
 
 def _preload_worker():
     global _PIPELINE
+    # CUDA check runs in background after server is up; no process exit, just error state if unavailable.
+    raw = str(os.environ.get("CUDA_PREFLIGHT_GRACE_SEC", str(_MIN_STARTUP_WAIT_SEC)) or str(_MIN_STARTUP_WAIT_SEC)).strip()
+    try:
+        requested = int(raw)
+        grace_sec = max(_MIN_STARTUP_WAIT_SEC, min(600, requested))
+    except ValueError:
+        grace_sec = _MIN_STARTUP_WAIT_SEC
+    if not _wait_for_cuda(grace_sec):
+        with _READY_LOCK:
+            _READY["status"] = "error"
+            _READY["detail"] = "CUDA not available after preflight grace (see logs). Process continues; /ready will report not ready."
+        _log.error("preload: aborting (CUDA unavailable); server remains up for /health and /ready")
+        return
+
     preload_retries = max(1, _int_env("TRELLIS2_PRELOAD_RETRIES", 3))
-    # Keep first retry delay short (15s) so transient failures don't blow startup to 12+ min.
     retry_base_sec = max(1, _int_env("TRELLIS2_PRELOAD_RETRY_BASE_SEC", 15))
     heartbeat_interval_sec = max(30, _int_env("TRELLIS2_PRELOAD_HEARTBEAT_SEC", 90))
-    preload_timeout = max(60, _int_env("PRELOAD_TIMEOUT", 300))
+    # At least 6 min for model loading/ready so we don't exit early on slow download or first load.
+    preload_timeout = max(_MIN_STARTUP_WAIT_SEC, _int_env("PRELOAD_TIMEOUT", _MIN_STARTUP_WAIT_SEC))
     start_time = time.time()
     deadline = start_time + preload_timeout
 
@@ -571,6 +604,7 @@ def _preload_worker():
                     _READY["detail"] = f"retry {attempt}/{preload_retries}"
                 print(f"[worker] preload: retry {attempt}/{preload_retries}", flush=True)
             else:
+                _log.info("preload: starting model preload")
                 print("[worker] preload: starting model preload", flush=True)
 
             # Heartbeat so long downloads/loads don't look stuck
@@ -592,6 +626,7 @@ def _preload_worker():
             dt = 0.0
             if st.get("started_at") and st.get("ready_at"):
                 dt = float(st["ready_at"]) - float(st["started_at"])
+            _log.info("preload: ready (load_time_sec=%.1f)", dt)
             print(f"[worker] preload: ready (load_time_sec={dt:.1f})", flush=True)
             return
         except Exception as e:
@@ -612,6 +647,7 @@ def _preload_worker():
             with _READY_LOCK:
                 _READY["status"] = "error"
                 _READY["detail"] = tb[-4000:] if tb else "unknown error"
+            _log.error("preload: ERROR (retries exhausted): %s", e, exc_info=True)
             print("[worker] preload: ERROR (retries exhausted)\n" + (tb or "unknown error"), flush=True)
 
 
@@ -629,6 +665,7 @@ def start_preload_in_background():
         _READY["status"] = "initializing_cuda"
         _READY["started_at"] = time.time()
         _READY["detail"] = "preload scheduled"
+    _log.info("preload: scheduled in background")
     t = threading.Thread(target=_preload_worker, daemon=True)
     t.start()
 

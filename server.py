@@ -13,6 +13,8 @@ Response shape mirrors other workers so a client can reuse the same protocol.
 
 from __future__ import annotations
 
+import atexit
+import logging
 import os
 import sys
 import traceback
@@ -20,27 +22,52 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
+# Configure logging first so we see messages even if later imports or startup fail.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    stream=sys.stderr,
+    force=True,
+)
+
+_log = logging.getLogger(__name__)
+_log.info("worker process starting")
+
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import FileResponse, JSONResponse
 
 from worker import (
-    assert_cuda_available_or_exit,
     generate_glb_from_image_bytes_list,
     get_ready_state,
     start_preload_in_background,
 )
 
+_log.info("worker module loaded")
 
 APP_PORT = int(os.environ.get("PORT", "8000"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/outputs"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _log_exit():
+    _log.info("process exiting")
+    try:
+        sys.stderr.flush()
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+atexit.register(_log_exit)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # CUDA preflight must run before preload so we fail fast and never import Triton without CUDA.
-    assert_cuda_available_or_exit()
+    _log.info("lifespan startup begin")
+    # Start server first so container is reachable; CUDA check + model load run in background.
     start_preload_in_background()
+    _log.info("HTTP server listening on 0.0.0.0:%s; preload (CUDA + model) running in background", APP_PORT)
     yield
 
 
@@ -171,4 +198,5 @@ def download(filename: str):
 if __name__ == "__main__":
     import uvicorn
 
+    _log.info("starting uvicorn on 0.0.0.0:%s", APP_PORT)
     uvicorn.run(app, host="0.0.0.0", port=APP_PORT, log_level="info")
