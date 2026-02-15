@@ -23,7 +23,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import FileResponse, JSONResponse
 
 from worker import (
-    assert_cuda_available,
+    assert_cuda_available_or_exit,
     generate_glb_from_image_bytes_list,
     get_ready_state,
     start_preload_in_background,
@@ -37,7 +37,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    assert_cuda_available()
+    # CUDA preflight must run before preload so we fail fast and never import Triton without CUDA.
+    assert_cuda_available_or_exit()
     start_preload_in_background()
     yield
 

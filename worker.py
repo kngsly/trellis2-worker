@@ -39,27 +39,99 @@ def _get_device():
     return os.environ.get("TRELLIS2_DEVICE", "cuda")
 
 
-def assert_cuda_available() -> None:
+def _cuda_failure_diagnostics() -> None:
     """
-    Fail fast at startup if CUDA is not available. Prevents silent CPU fallback
-    and infinite preload loops when the container cannot access NVIDIA runtime.
+    Emit a concise FATAL diagnostic block when CUDA is unavailable.
+    Production-only: runs on failure so rent.py can recycle the instance.
+    """
+    lines = [
+        "--- CUDA preflight FATAL diagnostics ---",
+    ]
+    try:
+        import torch
+        lines.append(f"torch.version={getattr(torch, '__version__', 'unknown')}")
+        lines.append(f"torch.cuda.is_available()={torch.cuda.is_available()}")
+        lines.append(f"torch.cuda.device_count()={torch.cuda.device_count()}")
+    except Exception as e:
+        lines.append(f"torch import/query failed: {e!r}")
+
+    try:
+        nvidia_devs = sorted(Path("/dev").glob("nvidia*"))
+        lines.append(f"/dev/nvidia* present: {[str(p) for p in nvidia_devs]}")
+    except Exception as e:
+        lines.append(f"/dev/nvidia* list failed: {e!r}")
+
+    try:
+        ctypes.CDLL("libcuda.so.1")
+        lines.append("libcuda.so.1: dlopen success")
+    except Exception as e:
+        lines.append(f"libcuda.so.1: dlopen failed ({e!r})")
+
+    nvidia_smi = Path("/usr/bin/nvidia-smi")
+    if not nvidia_smi.exists():
+        nvidia_smi = Path("/usr/local/bin/nvidia-smi")
+    if nvidia_smi.exists():
+        try:
+            p = subprocess.run(
+                [str(nvidia_smi), "-L"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            out = (p.stdout or "").strip()
+            err = (p.stderr or "").strip()
+            if out:
+                lines.append(f"nvidia-smi -L: {out[:500]}")
+            if err:
+                lines.append(f"nvidia-smi stderr: {err[:300]}")
+            if not out and not err:
+                lines.append(f"nvidia-smi -L rc={p.returncode}")
+        except Exception as e:
+            lines.append(f"nvidia-smi -L failed: {e!r}")
+    else:
+        lines.append("nvidia-smi: not found")
+
+    lines.append("--- end FATAL diagnostics ---")
+    for line in lines:
+        print(line, flush=True)
+
+
+def assert_cuda_available_or_exit() -> None:
+    """
+    Single entrypoint CUDA check when TRELLIS2_DEVICE=cuda. Optional bounded grace
+    period (CUDA_PREFLIGHT_GRACE_SEC, default 5, min 0 max 30). If CUDA remains
+    unavailable after grace, print FATAL diagnostics and sys.exit(1) so rent.py
+    can kill and retry on a different host/image.
     """
     if _get_device().lower() != "cuda":
         return
+    raw = str(os.environ.get("CUDA_PREFLIGHT_GRACE_SEC", "5") or "5").strip()
     try:
-        import torch
-    except ImportError:
-        print("FATAL: torch not available; cannot validate CUDA", flush=True)
-        sys.exit(1)
-    if not torch.cuda.is_available():
-        print("FATAL: CUDA not available inside container", flush=True)
-        print("Check NVIDIA runtime, drivers, and libcuda visibility", flush=True)
-        sys.exit(1)
-    try:
-        torch.cuda.get_device_name(0)
-    except Exception as e:
-        print("FATAL: CUDA device query failed:", e, flush=True)
-        sys.exit(1)
+        grace_sec = max(0, min(30, int(raw)))
+    except ValueError:
+        grace_sec = 5
+    deadline = time.time() + grace_sec
+
+    while time.time() < deadline:
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                try:
+                    torch.cuda.get_device_name(0)
+                    return
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+        if time.time() + 1.0 > deadline:
+            break
+        time.sleep(1.0)
+
+    print("FATAL: CUDA not available after preflight grace; exiting with diagnostics.", flush=True)
+    _cuda_failure_diagnostics()
+    sys.exit(1)
 
 
 def _prepend_env_path(name: str, value: str) -> None:
@@ -173,91 +245,6 @@ def _is_probably_driver_runtime_error(exc: BaseException) -> bool:
         "libcuda",
     )
     return any(m in s for m in markers)
-
-
-def _cuda_runtime_probe() -> tuple[bool, str]:
-    driver_info = ""
-    # 1) Device nodes present.
-    if not (Path("/dev/nvidiactl").exists() and Path("/dev/nvidia-uvm").exists()):
-        return (False, "missing /dev/nvidiactl or /dev/nvidia-uvm")
-
-    # 2) Driver linker name resolves.
-    try:
-        ctypes.CDLL("libcuda.so")
-    except Exception as e:
-        return (False, f"libcuda unresolved ({e})")
-
-    # 3) nvidia-smi reports at least one GPU (best effort).
-    try:
-        p = subprocess.run(
-            ["nvidia-smi", "-L"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=8,
-            check=False,
-        )
-        out = (p.stdout or "").strip()
-        if p.returncode != 0 or "GPU " not in out:
-            err = (p.stderr or "").strip()
-            return (False, f"nvidia-smi not ready rc={p.returncode} out={out[:140]!r} err={err[:140]!r}")
-        # Add driver hint to later probe failures (useful for CUDA/toolkit compatibility triage).
-        p_drv = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=8,
-            check=False,
-        )
-        if p_drv.returncode == 0:
-            driver_info = ((p_drv.stdout or "").strip().splitlines() or [""])[0].strip()
-    except Exception as e:
-        return (False, f"nvidia-smi probe failed ({e})")
-
-    # 4) Torch sees CUDA (defer heavy imports until needed).
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            if driver_info:
-                return (False, f"torch.cuda.is_available()=False (driver={driver_info})")
-            return (False, "torch.cuda.is_available()=False")
-        if int(torch.cuda.device_count()) <= 0:
-            if driver_info:
-                return (False, f"torch.cuda.device_count()=0 (driver={driver_info})")
-            return (False, "torch.cuda.device_count()=0")
-    except Exception as e:
-        return (False, f"torch cuda probe failed ({e})")
-
-    return (True, "cuda runtime ready")
-
-
-def _wait_for_cuda_runtime_ready() -> None:
-    if _get_device().lower() != "cuda":
-        return
-    max_wait_sec = int(os.environ.get("TRELLIS2_CUDA_READY_TIMEOUT_SEC", "180") or "180")
-    interval_sec = max(1, int(os.environ.get("TRELLIS2_CUDA_READY_POLL_SEC", "3") or "3"))
-    strict = _bool_env("TRELLIS2_CUDA_READY_STRICT", False)
-    deadline = time.time() + max(1, max_wait_sec)
-    last_detail = ""
-
-    while True:
-        ok, detail = _cuda_runtime_probe()
-        if ok:
-            if last_detail:
-                print(f"[worker] cuda-preflight: recovered ({detail})", flush=True)
-            return
-        last_detail = detail
-        if time.time() >= deadline:
-            msg = f"CUDA runtime did not become ready within {max_wait_sec}s: {detail}"
-            if strict:
-                raise RuntimeError(msg)
-            # Non-strict mode: continue into pipeline init retries to avoid false negatives on slow hosts.
-            print(f"[worker] cuda-preflight: warning: {msg}; continuing with deferred preload retries", flush=True)
-            return
-        print(f"[worker] cuda-preflight: waiting ({detail})", flush=True)
-        time.sleep(interval_sec)
 
 
 def _lazy_import_pipeline():
@@ -437,8 +424,13 @@ def _get_pipeline(deadline: Optional[float] = None):
     if _PIPELINE is not None:
         return _PIPELINE
 
+    # CUDA must already have been confirmed by assert_cuda_available_or_exit() at server startup.
     _ensure_cuda_linker_paths()
-    _wait_for_cuda_runtime_ready()
+
+    if _bool_env("TRELLIS2_DISABLE_TRITON", False):
+        os.environ["TRELLIS2_DISABLE_TRITON"] = "1"
+        # Some stacks respect this to avoid loading Triton/flex_gemm paths.
+        os.environ.setdefault("TRITON_DISABLE", "1")
 
     with _READY_LOCK:
         if _READY["status"] not in ("ready", "error"):
