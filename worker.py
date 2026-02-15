@@ -7,6 +7,7 @@ This module is imported by server.py.
 
 from __future__ import annotations
 
+import gc
 import io
 import os
 import threading
@@ -16,6 +17,22 @@ import uuid
 import ctypes
 from pathlib import Path
 from typing import List, Optional
+
+
+def _is_cuda_oom(error: Exception) -> bool:
+    msg = str(error).lower()
+    return "out of memory" in msg or "cuda out of memory" in msg
+
+
+def _cuda_empty_cache() -> None:
+    try:
+        import torch
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        gc.collect()
+        torch.cuda.synchronize()
+    except Exception:
+        pass
 
 import numpy as np
 from PIL import Image
@@ -34,6 +51,15 @@ _CUDA_RUNTIME_PREPARED = False
 
 def _get_device():
     return os.environ.get("TRELLIS2_DEVICE", "cuda")
+
+
+def _configure_hf_timeouts_for_deadline(deadline_seconds: float) -> None:
+    """Set HuggingFace hub timeouts from remaining deadline to avoid unlimited blocking during model downloads."""
+    if deadline_seconds <= 0:
+        return
+    sec = max(1, int(deadline_seconds))
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(sec))
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", str(min(sec, 60)))
 
 
 def _prepend_env_path(name: str, value: str) -> None:
@@ -348,6 +374,9 @@ def get_ready_state() -> dict:
 def _preload_worker():
     try:
         print("[worker] preload: starting model preload", flush=True)
+        preload_timeout = _int_env("PRELOAD_TIMEOUT", 0)
+        if preload_timeout > 0:
+            _configure_hf_timeouts_for_deadline(float(preload_timeout))
         _get_pipeline()
         st = get_ready_state()
         dt = 0.0
@@ -690,7 +719,7 @@ def _int_env(name: str, default: int) -> int:
 def _choose_export_params(low_poly: bool):
     if low_poly:
         return (
-            _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 250000),
+            _int_env("TRELLIS2_DECIMATION_TARGET", 75000),
             _int_env("TRELLIS2_TEXTURE_SIZE_LOW_POLY", 2048),
         )
     return (
@@ -711,6 +740,7 @@ def generate_glb_from_image_bytes_list(
     if not images_bytes:
         raise ValueError("empty upload")
 
+    _cuda_empty_cache()
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
@@ -846,23 +876,52 @@ def generate_glb_from_image_bytes_list(
             raise RuntimeError("pipeline.run() failed after retries") from last_err
 
     # Export to GLB via o-voxel postprocess util.
+    _cuda_empty_cache()
+    decimation_min_fallback = _int_env("TRELLIS2_DECIMATION_MIN_OOM_FALLBACK", 15000)
+    oom_retries = _int_env("TRELLIS2_TO_GLB_OOM_RETRIES", 1)
     decimation_target, texture_size = _choose_export_params(low_poly)
     uid = uuid.uuid4().hex
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=mesh.layout,
-        voxel_size=mesh.voxel_size,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=int(decimation_target),
-        texture_size=int(texture_size),
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        verbose=True,
-    )
+    last_glb_err: Optional[BaseException] = None
+    for glb_attempt in range(max(1, oom_retries + 1)):
+        try:
+            glb = o_voxel.postprocess.to_glb(
+                vertices=mesh.vertices,
+                faces=mesh.faces,
+                attr_volume=mesh.attrs,
+                coords=mesh.coords,
+                attr_layout=mesh.layout,
+                voxel_size=mesh.voxel_size,
+                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                decimation_target=int(decimation_target),
+                texture_size=int(texture_size),
+                remesh=True,
+                remesh_band=1,
+                remesh_project=0,
+                verbose=True,
+            )
+            break
+        except Exception as e:
+            last_glb_err = e
+            if _is_cuda_oom(e) and glb_attempt < oom_retries:
+                _cuda_empty_cache()
+                new_target = max(decimation_min_fallback, decimation_target // 2)
+                if new_target >= decimation_target:
+                    raise RuntimeError(
+                        f"CUDA OOM during mesh postprocessing (decimation already at minimum {decimation_min_fallback}). "
+                        "Increase TRELLIS2_DECIMATION_MIN_OOM_FALLBACK or reduce decimation target."
+                    ) from e
+                print(
+                    f"[worker] GLB postprocess CUDA OOM; retrying with decimation_target={new_target} (min={decimation_min_fallback})",
+                    flush=True,
+                )
+                decimation_target = new_target
+                continue
+            if _is_cuda_oom(last_glb_err):
+                raise RuntimeError(
+                    "Mesh postprocessing failed (out of memory after retries). "
+                    "Try lowering TRELLIS2_DECIMATION_TARGET or increasing GPU memory."
+                ) from last_glb_err
+            raise
 
     out_path = out_dir / f"{uid}.glb"
     # Blender compatibility: many installs do not decode embedded WebP textures.

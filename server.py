@@ -14,7 +14,10 @@ Response shape mirrors other workers so a client can reuse the same protocol.
 from __future__ import annotations
 
 import os
+import sys
 import traceback
+import ctypes
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
@@ -28,11 +31,32 @@ from worker import (
 )
 
 
+def assert_cuda_available_or_exit() -> None:
+    import torch
+    if not torch.cuda.is_available():
+        print("FATAL: CUDA not available", flush=True)
+        sys.exit(1)
+    try:
+        ctypes.CDLL("libcuda.so.1")
+    except Exception as e:
+        print(f"FATAL: libcuda.so.1 missing: {e}", flush=True)
+        sys.exit(1)
+
+
 APP_PORT = int(os.environ.get("PORT", "8000"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/outputs"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    assert_cuda_available_or_exit()
+    start_preload_in_background()
+    yield
+    # shutdown: nothing to tear down
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
@@ -45,11 +69,6 @@ def ready():
     st = get_ready_state()
     ok = st.get("status") == "ready"
     return JSONResponse({"ready": bool(ok), **st}, status_code=200)
-
-
-@app.on_event("startup")
-def _startup():
-    start_preload_in_background()
 
 
 def _parse_bool(v: Optional[str], default: bool = False) -> bool:
