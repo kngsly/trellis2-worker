@@ -20,6 +20,22 @@ import ctypes
 from pathlib import Path
 from typing import List, Optional
 
+
+def _is_cuda_oom(error: Exception) -> bool:
+    msg = str(error).lower()
+    return "out of memory" in msg or "cuda out of memory" in msg
+
+
+def _cuda_empty_cache() -> None:
+    try:
+        import torch
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        gc.collect()
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
 import numpy as np
 from PIL import Image
 
@@ -974,6 +990,7 @@ def generate_glb_from_image_bytes_list(
     if not images_bytes:
         raise ValueError("empty upload")
 
+    _cuda_empty_cache()
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 

@@ -14,6 +14,7 @@ Response shape mirrors other workers so a client can reuse the same protocol.
 from __future__ import annotations
 
 import os
+import sys
 import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
