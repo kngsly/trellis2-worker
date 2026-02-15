@@ -465,21 +465,78 @@ def get_ready_state() -> dict:
         return dict(_READY)
 
 
-def _preload_worker():
-    try:
-        print("[worker] preload: starting model preload", flush=True)
-        _get_pipeline()
-        st = get_ready_state()
-        dt = 0.0
-        if st.get("started_at") and st.get("ready_at"):
-            dt = float(st["ready_at"]) - float(st["started_at"])
-        print(f"[worker] preload: ready (load_time_sec={dt:.1f})", flush=True)
-    except Exception:
-        tb = traceback.format_exc()
+def _preload_heartbeat(interval_sec: float, started_at: float) -> None:
+    """Log progress every interval_sec while preload is still loading/downloading."""
+    while True:
+        time.sleep(interval_sec)
         with _READY_LOCK:
-            _READY["status"] = "error"
-            _READY["detail"] = tb[-4000:] if tb else "unknown error"
-        print("[worker] preload: ERROR\n" + (tb or "unknown error"), flush=True)
+            status = _READY.get("status", "")
+            if status in ("ready", "error"):
+                return
+            elapsed = time.time() - started_at
+            detail = (_READY.get("detail") or "").strip() or "loading"
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        print(f"[worker] preload: still {status} ({mins}m {secs}s elapsed) {detail[:80]}", flush=True)
+
+
+def _preload_worker():
+    global _PIPELINE
+    preload_retries = max(1, _int_env("TRELLIS2_PRELOAD_RETRIES", 3))
+    retry_base_sec = max(1, _int_env("TRELLIS2_PRELOAD_RETRY_BASE_SEC", 60))
+    heartbeat_interval_sec = max(30, _int_env("TRELLIS2_PRELOAD_HEARTBEAT_SEC", 90))
+
+    for attempt in range(1, preload_retries + 1):
+        try:
+            if attempt > 1:
+                _PIPELINE = None
+                with _READY_LOCK:
+                    _READY["status"] = "loading"
+                    _READY["detail"] = f"retry {attempt}/{preload_retries}"
+                print(f"[worker] preload: retry {attempt}/{preload_retries}", flush=True)
+            else:
+                print("[worker] preload: starting model preload", flush=True)
+
+            # Heartbeat so long downloads/loads don't look stuck
+            started_at = time.time()
+            heartbeat = threading.Thread(
+                target=_preload_heartbeat,
+                args=(heartbeat_interval_sec, started_at),
+                daemon=True,
+            )
+            heartbeat.start()
+
+            try:
+                _get_pipeline()
+            finally:
+                # Heartbeat thread exits when status becomes ready/error
+                pass
+
+            st = get_ready_state()
+            dt = 0.0
+            if st.get("started_at") and st.get("ready_at"):
+                dt = float(st["ready_at"]) - float(st["started_at"])
+            print(f"[worker] preload: ready (load_time_sec={dt:.1f})", flush=True)
+            return
+        except Exception as e:
+            if attempt < preload_retries:
+                sleep_sec = min(3600, retry_base_sec * (2 ** (attempt - 1)))
+                with _READY_LOCK:
+                    _READY["status"] = "loading"
+                    _READY["detail"] = f"preload failed attempt {attempt}/{preload_retries}, retry in {sleep_sec}s"
+                print(
+                    f"[worker] preload: attempt {attempt}/{preload_retries} failed: {e!r}; retrying in {sleep_sec}s",
+                    flush=True,
+                )
+                if _is_cuda_oom(e):
+                    _cuda_empty_cache()
+                time.sleep(sleep_sec)
+                continue
+            tb = traceback.format_exc()
+            with _READY_LOCK:
+                _READY["status"] = "error"
+                _READY["detail"] = tb[-4000:] if tb else "unknown error"
+            print("[worker] preload: ERROR (retries exhausted)\n" + (tb or "unknown error"), flush=True)
 
 
 def start_preload_in_background():
@@ -675,6 +732,7 @@ def _cuda_empty_cache() -> None:
     try:
         import torch
         if torch.cuda.is_available():
+            torch.cuda.synchronize()  # finish pending work (helps after prior OOM)
             torch.cuda.empty_cache()
             gc.collect()
     except Exception:
@@ -961,9 +1019,13 @@ def generate_glb_from_image_bytes_list(
         # less destructive input variant once.
         input_fallback_attempted = False
 
+        # Free VRAM after preprocessing (rembg etc.) so pipe.run() has maximum headroom.
+        _cuda_empty_cache()
+
         attempt = 0
         max_attempts = max(1, retries)
         img0 = primary_img
+        oom_run_retried = False
         while True:
             try:
                 torch.manual_seed(int(seed) + attempt)
@@ -976,6 +1038,12 @@ def generate_glb_from_image_bytes_list(
                 break
             except Exception as e:
                 last_err = e
+                # One-time retry on CUDA OOM (e.g. reused instance with fragmented VRAM).
+                if _is_cuda_oom(e) and not oom_run_retried:
+                    oom_run_retried = True
+                    _cuda_empty_cache()
+                    print("[worker] pipe.run OOM, clearing cache and retrying once", flush=True)
+                    continue
                 if not _is_empty_sparse_error(e):
                     raise
 
