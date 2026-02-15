@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
@@ -22,6 +23,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import FileResponse, JSONResponse
 
 from worker import (
+    assert_cuda_available,
     generate_glb_from_image_bytes_list,
     get_ready_state,
     start_preload_in_background,
@@ -32,7 +34,15 @@ APP_PORT = int(os.environ.get("PORT", "8000"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/outputs"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    assert_cuda_available()
+    start_preload_in_background()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
@@ -45,11 +55,6 @@ def ready():
     st = get_ready_state()
     ok = st.get("status") == "ready"
     return JSONResponse({"ready": bool(ok), **st}, status_code=200)
-
-
-@app.on_event("startup")
-def _startup():
-    start_preload_in_background()
 
 
 def _parse_bool(v: Optional[str], default: bool = False) -> bool:

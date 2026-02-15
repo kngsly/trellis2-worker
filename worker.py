@@ -11,6 +11,7 @@ import gc
 import io
 import os
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -25,7 +26,7 @@ from PIL import Image
 
 _PIPELINE = None
 _READY = {
-    "status": "not_started",  # not_started | downloading | loading | ready | error
+    "status": "not_started",  # not_started | initializing_cuda | loading_weights | downloading_model | ready | error
     "detail": "",
     "started_at": 0.0,
     "ready_at": 0.0,
@@ -36,6 +37,29 @@ _CUDA_RUNTIME_PREPARED = False
 
 def _get_device():
     return os.environ.get("TRELLIS2_DEVICE", "cuda")
+
+
+def assert_cuda_available() -> None:
+    """
+    Fail fast at startup if CUDA is not available. Prevents silent CPU fallback
+    and infinite preload loops when the container cannot access NVIDIA runtime.
+    """
+    if _get_device().lower() != "cuda":
+        return
+    try:
+        import torch
+    except ImportError:
+        print("FATAL: torch not available; cannot validate CUDA", flush=True)
+        sys.exit(1)
+    if not torch.cuda.is_available():
+        print("FATAL: CUDA not available inside container", flush=True)
+        print("Check NVIDIA runtime, drivers, and libcuda visibility", flush=True)
+        sys.exit(1)
+    try:
+        torch.cuda.get_device_name(0)
+    except Exception as e:
+        print("FATAL: CUDA device query failed:", e, flush=True)
+        sys.exit(1)
 
 
 def _prepend_env_path(name: str, value: str) -> None:
@@ -254,6 +278,21 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return default
 
 
+def _configure_hf_timeouts_for_deadline(deadline: Optional[float]) -> None:
+    """
+    When PRELOAD_TIMEOUT/deadline is active, cap Hugging Face hub env timeouts
+    to the remaining budget so from_pretrained cannot block past the deadline.
+    Uses setdefault so user-set HF_HUB_* vars are not overridden.
+    """
+    if deadline is None:
+        return
+    remaining = int(max(1, deadline - time.time()))
+    download_timeout = min(30, remaining)
+    etag_timeout = min(30, remaining)
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(download_timeout))
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", str(etag_timeout))
+
+
 def _should_avoid_gated_deps() -> bool:
     # Using a different image conditioner than the one specified by the checkpoint (pipeline.json)
     # can severely degrade output quality. Default to upstream behavior unless explicitly overridden.
@@ -393,7 +432,7 @@ def _build_pipeline_with_rembg_override(model_id: str):
     return pipe
 
 
-def _get_pipeline():
+def _get_pipeline(deadline: Optional[float] = None):
     global _PIPELINE
     if _PIPELINE is not None:
         return _PIPELINE
@@ -402,10 +441,11 @@ def _get_pipeline():
     _wait_for_cuda_runtime_ready()
 
     with _READY_LOCK:
-        if _READY["status"] == "not_started":
-            _READY["status"] = "loading"
-            _READY["started_at"] = time.time()
-            _READY["detail"] = "initializing pipeline"
+        if _READY["status"] not in ("ready", "error"):
+            _READY["status"] = "loading_weights"
+            if _READY["started_at"] == 0.0:
+                _READY["started_at"] = time.time()
+            _READY["detail"] = "CUDA ready, loading pipeline"
 
     model_id = os.environ.get("TRELLIS2_MODEL_ID", "microsoft/TRELLIS.2-4B")
     Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
@@ -415,18 +455,35 @@ def _get_pipeline():
     last_err = None
 
     for attempt in range(1, retries + 1):
+        if deadline is not None and time.time() > deadline:
+            _msg = (
+                "Model preload timeout. Likely CUDA initialization failure or stalled download."
+                f" HF_HUB_DOWNLOAD_TIMEOUT={os.environ.get('HF_HUB_DOWNLOAD_TIMEOUT')}"
+                f" HF_HUB_ETAG_TIMEOUT={os.environ.get('HF_HUB_ETAG_TIMEOUT')}"
+            )
+            raise RuntimeError(_msg)
         try:
+            _configure_hf_timeouts_for_deadline(deadline)
+            with _READY_LOCK:
+                _READY["status"] = "downloading_model"
+                _READY["detail"] = "downloading/loading model weights"
             if _should_avoid_gated_deps():
                 pipe = _build_pipeline_with_image_cond_override(model_id)
             elif _should_avoid_gated_rembg_deps():
                 pipe = _build_pipeline_with_rembg_override(model_id)
             else:
                 pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
+            with _READY_LOCK:
+                _READY["status"] = "loading_weights"
+                _READY["detail"] = "moving to device"
             break
         except Exception as e:
             last_err = e
             # If the upstream config points at a gated model, fall back to a non-gated alternative.
             if _is_gated_repo_error(e):
+                with _READY_LOCK:
+                    _READY["status"] = "loading_weights"
+                    _READY["detail"] = "moving to device"
                 if _should_avoid_gated_deps():
                     pipe = _build_pipeline_with_image_cond_override(model_id)
                 elif _should_avoid_gated_rembg_deps():
@@ -483,15 +540,26 @@ def _preload_heartbeat(interval_sec: float, started_at: float) -> None:
 def _preload_worker():
     global _PIPELINE
     preload_retries = max(1, _int_env("TRELLIS2_PRELOAD_RETRIES", 3))
-    retry_base_sec = max(1, _int_env("TRELLIS2_PRELOAD_RETRY_BASE_SEC", 60))
+    # Keep first retry delay short (15s) so transient failures don't blow startup to 12+ min.
+    retry_base_sec = max(1, _int_env("TRELLIS2_PRELOAD_RETRY_BASE_SEC", 15))
     heartbeat_interval_sec = max(30, _int_env("TRELLIS2_PRELOAD_HEARTBEAT_SEC", 90))
+    preload_timeout = max(60, _int_env("PRELOAD_TIMEOUT", 300))
+    start_time = time.time()
+    deadline = start_time + preload_timeout
 
     for attempt in range(1, preload_retries + 1):
+        if time.time() > deadline:
+            _msg = (
+                "Model preload timeout. Likely CUDA initialization failure or stalled download."
+                f" HF_HUB_DOWNLOAD_TIMEOUT={os.environ.get('HF_HUB_DOWNLOAD_TIMEOUT')}"
+                f" HF_HUB_ETAG_TIMEOUT={os.environ.get('HF_HUB_ETAG_TIMEOUT')}"
+            )
+            raise RuntimeError(_msg)
         try:
             if attempt > 1:
                 _PIPELINE = None
                 with _READY_LOCK:
-                    _READY["status"] = "loading"
+                    _READY["status"] = "loading_weights"
                     _READY["detail"] = f"retry {attempt}/{preload_retries}"
                 print(f"[worker] preload: retry {attempt}/{preload_retries}", flush=True)
             else:
@@ -507,7 +575,7 @@ def _preload_worker():
             heartbeat.start()
 
             try:
-                _get_pipeline()
+                _get_pipeline(deadline=deadline)
             finally:
                 # Heartbeat thread exits when status becomes ready/error
                 pass
@@ -522,7 +590,7 @@ def _preload_worker():
             if attempt < preload_retries:
                 sleep_sec = min(3600, retry_base_sec * (2 ** (attempt - 1)))
                 with _READY_LOCK:
-                    _READY["status"] = "loading"
+                    _READY["status"] = "loading_weights"
                     _READY["detail"] = f"preload failed attempt {attempt}/{preload_retries}, retry in {sleep_sec}s"
                 print(
                     f"[worker] preload: attempt {attempt}/{preload_retries} failed: {e!r}; retrying in {sleep_sec}s",
@@ -550,7 +618,7 @@ def start_preload_in_background():
     with _READY_LOCK:
         if _READY["status"] != "not_started":
             return
-        _READY["status"] = "downloading"
+        _READY["status"] = "initializing_cuda"
         _READY["started_at"] = time.time()
         _READY["detail"] = "preload scheduled"
     t = threading.Thread(target=_preload_worker, daemon=True)
