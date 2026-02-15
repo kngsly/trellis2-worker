@@ -833,7 +833,7 @@ def _int_env(name: str, default: int) -> int:
 def _choose_export_params(low_poly: bool):
     if low_poly:
         return (
-            _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 150000),
+            _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 75000),
             _int_env("TRELLIS2_TEXTURE_SIZE_LOW_POLY", 2048),
         )
     return (
@@ -999,7 +999,7 @@ def generate_glb_from_image_bytes_list(
         decimation_target, texture_size = _choose_export_params(low_poly)
         decimation_initial = int(decimation_target)
         uid = uuid.uuid4().hex
-        dec_min = _int_env("TRELLIS2_DECIMATION_MIN_OOM_FALLBACK", 25000)
+        dec_min = _int_env("TRELLIS2_DECIMATION_MIN_OOM_FALLBACK", 15000)
         glb = None
         last_glb_err = None
         oom_retries = 0

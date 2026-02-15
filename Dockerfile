@@ -166,25 +166,45 @@ def patch_empty_coords_guard(s: str) -> str:
 patched = patch_file(p, patch_empty_coords_guard)
 print(f"Patched empty sparse coords guard: {patched}")
 
-# 4) O-Voxel postprocess: cleanup after remesh (the standard branch already does this)
+# 4) O-Voxel postprocess: cap remesh resolution for low-poly to reduce CuMesh simplify VRAM (avoids OOM on 24GB)
 ov = root / "o-voxel" / "o_voxel" / "postprocess.py"
-ov_marker = "# trellis2-worker build patch: cleanup after remesh"
-def patch_ovoxel_cleanup(s: str) -> str:
-    if ov_marker in s:
+ov_res_marker = "# trellis2-worker build patch: cap remesh resolution for low decimation"
+def patch_ovoxel_remesh_res(s: str) -> str:
+    if ov_res_marker in s:
         return s
-    needle = "        mesh.simplify(decimation_target, verbose=verbose)\\n"
+    needle = "        resolution = grid_size.max().item()\n"
+    if needle not in s:
+        print("WARN: o_voxel postprocess resolution needle not found; skipping remesh resolution cap")
+        return s
+    repl = (
+        needle
+        + f"        {ov_res_marker}\n"
+        + "        if decimation_target <= 200000:\n"
+        + "            resolution = min(resolution, 512)\n"
+    )
+    return s.replace(needle, repl, 1)
+
+patched = patch_file(ov, patch_ovoxel_remesh_res)
+print(f"Patched o_voxel remesh resolution cap: {patched}")
+
+# 5) O-Voxel postprocess: cleanup after remesh (the standard branch already does this)
+ov_cleanup_marker = "# trellis2-worker build patch: cleanup after remesh"
+def patch_ovoxel_cleanup(s: str) -> str:
+    if ov_cleanup_marker in s:
+        return s
+    needle = "        mesh.simplify(decimation_target, verbose=verbose)\n"
     idx = s.find(needle)
     if idx == -1:
         print("WARN: o_voxel postprocess simplify needle not found; skipping remesh cleanup patch")
         return s
     insert = (
         needle
-        + f"        {ov_marker}\\n"
-        + "        mesh.remove_duplicate_faces()\\n"
-        + "        mesh.repair_non_manifold_edges()\\n"
-        + "        mesh.remove_small_connected_components(1e-5)\\n"
-        + "        mesh.fill_holes(max_hole_perimeter=3e-2)\\n"
-        + "        mesh.unify_face_orientations()\\n"
+        + f"        {ov_cleanup_marker}\n"
+        + "        mesh.remove_duplicate_faces()\n"
+        + "        mesh.repair_non_manifold_edges()\n"
+        + "        mesh.remove_small_connected_components(1e-5)\n"
+        + "        mesh.fill_holes(max_hole_perimeter=3e-2)\n"
+        + "        mesh.unify_face_orientations()\n"
     )
     return s.replace(needle, insert, 1)
 
