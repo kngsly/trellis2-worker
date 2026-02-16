@@ -76,6 +76,7 @@ def _find_nvidia_smi() -> Optional[Path]:
 # Known minimum driver versions for each CUDA toolkit major.minor.
 # Source: https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/
 _CUDA_MIN_DRIVER: dict[str, int] = {
+    "13.0": 570,
     "12.8": 570,
     "12.7": 565,
     "12.6": 560,
@@ -377,6 +378,10 @@ def _wait_for_cuda(grace_sec: int) -> bool:
     if _get_device().lower() != "cuda":
         _log.info("CUDA preflight skipped (TRELLIS2_DEVICE!=cuda)")
         return True
+
+    # Defence-in-depth: disable CUDA compat library if host driver is sufficient.
+    # This is a fallback for when start.sh was bypassed.
+    _disable_cuda_compat_if_unneeded()
 
     # Phase 1: fast environment check (~5s). Detect driver/runtime mismatch before
     # entering the slow polling loop. This catches error 803 and similar issues.
@@ -701,6 +706,81 @@ def _ensure_cuda_linker_paths() -> None:
         print(f"[worker] cuda-preflight: using {link_path}", flush=True)
     except Exception as e:
         print(f"[worker] cuda-preflight: libcuda still unresolved ({e})", flush=True)
+
+
+def _disable_cuda_compat_if_unneeded() -> None:
+    """
+    Defence-in-depth: remove /usr/local/cuda/compat from LD_LIBRARY_PATH when
+    the host driver is already new enough for the CUDA toolkit version.
+
+    The compat library ships a user-mode libcuda.so.1 built for the *minimum*
+    supported driver.  If the host kernel-mode driver is *newer*, loading that
+    older user-mode lib causes CUDA Error 803 ("unsupported display driver /
+    cuda driver combination").
+
+    start.sh does this at the shell level before Python launches, but this
+    function acts as a fallback in case the container was started without the
+    wrapper (e.g. ``docker run ... python server.py`` directly).
+
+    NOTE: LD_LIBRARY_PATH is cached by glibc at process startup, so editing
+    os.environ alone does NOT affect dlopen() within the *current* process.
+    However, it *will* help child processes and it allows _cuda_env_info() to
+    log the corrected path, making diagnostics clearer.
+    """
+    compat_dir = "/usr/local/cuda/compat"
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if compat_dir not in ld_path:
+        return
+
+    # Determine host driver major version via nvidia-smi
+    smi = _find_nvidia_smi()
+    if smi is None:
+        return
+    try:
+        p = subprocess.run(
+            [str(smi), "--query-gpu=driver_version", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=5, check=False,
+        )
+        driver_ver = (p.stdout or "").strip().splitlines()[0] if p.returncode == 0 else ""
+    except Exception:
+        return
+
+    driver_major = _parse_driver_major(driver_ver)
+    if driver_major is None:
+        return
+
+    # Determine minimum driver for the current CUDA runtime
+    min_driver = None
+    try:
+        import torch
+        cuda_rt = getattr(torch.version, "cuda", None)
+        if cuda_rt:
+            cuda_mm = ".".join(cuda_rt.split(".")[:2])
+            min_driver = _CUDA_MIN_DRIVER.get(cuda_mm)
+    except Exception:
+        pass
+
+    # Fallback: assume 570 (CUDA 13.0 / 12.8 minimum)
+    if min_driver is None:
+        min_driver = 570
+
+    if driver_major >= min_driver:
+        new_path = ":".join(
+            d for d in ld_path.split(":") if d and d != compat_dir
+        )
+        os.environ["LD_LIBRARY_PATH"] = new_path
+        print(
+            f"[worker] cuda-compat: host driver {driver_ver} (major={driver_major}) "
+            f">= {min_driver}; removed {compat_dir} from LD_LIBRARY_PATH",
+            flush=True,
+        )
+    else:
+        print(
+            f"[worker] cuda-compat: host driver {driver_ver} (major={driver_major}) "
+            f"< {min_driver}; keeping {compat_dir} for forward compat",
+            flush=True,
+        )
 
 
 def _is_probably_driver_runtime_error(exc: BaseException) -> bool:

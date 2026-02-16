@@ -278,9 +278,11 @@ RUN mkdir -p /tmp/extensions \
 
 COPY server.py /app/server.py
 COPY worker.py /app/worker.py
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
 
 RUN mkdir -p /outputs
 ENV OUTPUT_DIR=/outputs
 
 EXPOSE 8000
-CMD ["python", "server.py"]
+CMD ["/app/start.sh"]
