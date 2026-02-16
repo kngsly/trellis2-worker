@@ -307,6 +307,43 @@ def _cuda_failure_diagnostics() -> None:
         print(line, flush=True)
 
 
+def _try_torch_cuda_with_timeout(timeout_sec: float) -> tuple[bool, Optional[str]]:
+    """
+    Try torch.cuda.is_available() in a thread with a timeout.
+    torch.cuda.is_available() can hang indefinitely on certain driver states,
+    so we need a thread-based timeout wrapper.
+
+    Returns: (success: bool, error_msg: Optional[str])
+      - (True, None) if CUDA is available
+      - (False, "timeout") if the call didn't complete within timeout_sec
+      - (False, error_msg) if torch.cuda.is_available() raised an exception
+    """
+    result = {"available": False, "error": None, "done": False}
+
+    def _check_cuda():
+        try:
+            import torch
+            available = torch.cuda.is_available()
+            result["available"] = available
+            result["done"] = True
+        except Exception as e:
+            result["error"] = str(e)
+            result["done"] = True
+
+    thread = threading.Thread(target=_check_cuda, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_sec)
+
+    if not result["done"]:
+        # Thread didn't finish - torch.cuda.is_available() is hung
+        return (False, "timeout")
+
+    if result["error"] is not None:
+        return (False, result["error"])
+
+    return (result["available"], None)
+
+
 def _wait_for_cuda(grace_sec: int) -> bool:
     """
     Wait up to grace_sec for CUDA to become available (TRELLIS2_DEVICE=cuda only).
@@ -315,6 +352,9 @@ def _wait_for_cuda(grace_sec: int) -> bool:
 
     Fast-fail: if driver/runtime incompatibility is detected (e.g. error 803),
     fails within ~10s instead of polling for the full grace period.
+
+    CRITICAL: torch.cuda.is_available() can hang indefinitely on certain driver states.
+    We use a thread-based timeout wrapper to prevent indefinite hangs.
     """
     global _CUDA_ENV_INFO
     if _get_device().lower() != "cuda":
@@ -353,50 +393,95 @@ def _wait_for_cuda(grace_sec: int) -> bool:
             _cuda_failure_diagnostics()
             return False
 
-    # Phase 2: poll torch.cuda.is_available() with reduced timeout if driver looks OK
-    fast_fail_sec = max(10, min(15, int(os.environ.get("CUDA_FAST_FAIL_SEC", "15") or "15")))
+    # Phase 2: poll torch.cuda.is_available() with thread-based timeout to prevent hangs
+    # Use an aggressive timeout per attempt (20s) since torch can hang indefinitely
+    torch_check_timeout = max(20, min(30, int(os.environ.get("CUDA_TORCH_CHECK_TIMEOUT_SEC", "20") or "20")))
+    fast_fail_sec = max(10, min(45, int(os.environ.get("CUDA_FAST_FAIL_SEC", "30") or "30")))
     _log.info(
         "CUDA preflight phase 2: waiting up to %s s for torch CUDA init "
-        "(fast-fail after %s s if no progress, full grace %s s)",
-        grace_sec, fast_fail_sec, grace_sec,
+        "(per-attempt timeout %s s, fast-fail after %s s if no progress, full grace %s s)",
+        grace_sec, torch_check_timeout, fast_fail_sec, grace_sec,
     )
     with _READY_LOCK:
         _READY["detail"] = "waiting for torch CUDA initialization"
+
     deadline = time.time() + grace_sec
     fast_fail_deadline = time.time() + fast_fail_sec
     last_log = 0.0
-    log_interval = 15.0  # Log more frequently for debugging
+    log_interval = 10.0  # Log every 10s for better visibility
     first_torch_error: Optional[str] = None
+    hung_count = 0  # Track how many times torch.cuda.is_available() hung
 
+    attempt = 0
     while time.time() < deadline:
+        attempt += 1
         try:
-            import torch
-            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-                try:
-                    name = torch.cuda.get_device_name(0)
-                    _log.info("CUDA preflight ok: %s", name)
-                    # Update env info with successful torch init
-                    env_info["torch_cuda_available"] = True
-                    try:
-                        env_info["gpu_count"] = torch.cuda.device_count()
-                        env_info["gpu_names"] = [
-                            torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
-                        ]
-                    except Exception:
-                        pass
+            # Try torch.cuda.is_available() with a timeout wrapper
+            _log.info("CUDA preflight: checking torch.cuda.is_available() (attempt #%d, timeout %ds)", attempt, torch_check_timeout)
+            success, error_msg = _try_torch_cuda_with_timeout(torch_check_timeout)
+
+            if error_msg == "timeout":
+                hung_count += 1
+                _log.warning(
+                    "CUDA preflight: torch.cuda.is_available() hung for %ds (hung_count=%d)",
+                    torch_check_timeout, hung_count
+                )
+                print(
+                    f"[worker] CUDA preflight: torch.cuda.is_available() HUNG for {torch_check_timeout}s "
+                    f"(attempt #{attempt}, hung_count={hung_count}). Likely driver issue.",
+                    flush=True
+                )
+                # If torch has hung multiple times, fast-fail
+                if hung_count >= 2:
+                    _log.error("CUDA preflight FAST FAIL: torch.cuda.is_available() hung %d times", hung_count)
+                    print(
+                        f"CUDA preflight FAST FAIL: torch.cuda.is_available() hung {hung_count} times. "
+                        f"Host driver likely incompatible or soft-locked.",
+                        flush=True
+                    )
+                    env_info["compat_ok"] = False
+                    env_info["compat_error"] = f"torch.cuda.is_available() hung {hung_count} times ({torch_check_timeout}s timeout)"
                     _CUDA_ENV_INFO = env_info
                     with _READY_LOCK:
+                        _READY["detail"] = f"CUDA init hung (torch blocked {hung_count}x)"
                         _READY["cuda_env"] = env_info
-                    return True
-                except Exception:
-                    pass
-        except ImportError:
-            pass
+                    _cuda_failure_diagnostics()
+                    return False
+                # Continue polling - maybe next attempt will work
+                continue
+
+            if error_msg is not None:
+                # torch.cuda.is_available() raised an exception
+                if first_torch_error is None:
+                    first_torch_error = error_msg
+                    _log.warning("CUDA preflight: torch error on attempt #%d: %s", attempt, first_torch_error)
+                    print(f"[worker] CUDA preflight: torch error: {first_torch_error[:200]}", flush=True)
+
+            if success:
+                # CUDA is available! Verify we can get device name
+                try:
+                    import torch
+                    if torch.cuda.device_count() > 0:
+                        name = torch.cuda.get_device_name(0)
+                        _log.info("CUDA preflight ok: %s (attempt #%d)", name, attempt)
+                        print(f"[worker] CUDA preflight OK: {name} (took {attempt} attempt(s))", flush=True)
+                        # Update env info with successful torch init
+                        env_info["torch_cuda_available"] = True
+                        try:
+                            env_info["gpu_count"] = torch.cuda.device_count()
+                            env_info["gpu_names"] = [
+                                torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
+                            ]
+                        except Exception:
+                            pass
+                        _CUDA_ENV_INFO = env_info
+                        with _READY_LOCK:
+                            _READY["cuda_env"] = env_info
+                        return True
+                except Exception as e:
+                    _log.warning("CUDA available but device_count/get_device_name failed: %s", e)
         except Exception as e:
-            # Capture the first torch CUDA error for fast-fail analysis
-            if first_torch_error is None:
-                first_torch_error = str(e)
-                _log.warning("CUDA preflight: torch error on first attempt: %s", first_torch_error)
+            _log.warning("CUDA preflight: unexpected error in attempt #%d: %s", attempt, e)
 
         now = time.time()
 
@@ -430,19 +515,26 @@ def _wait_for_cuda(grace_sec: int) -> bool:
 
         if now - last_log >= log_interval:
             remaining = max(0, int(deadline - now))
-            _log.info("CUDA preflight still waiting for device (~%s s remaining)", remaining)
+            _log.info("CUDA preflight still waiting (attempt #%d, ~%d s remaining, hung_count=%d)", attempt, remaining, hung_count)
             with _READY_LOCK:
-                _READY["detail"] = f"waiting for CUDA device (~{remaining}s remaining)"
+                _READY["detail"] = f"waiting for CUDA device (~{remaining}s remaining, attempt #{attempt})"
             last_log = now
+
         if now + 1.0 > deadline:
             break
-        time.sleep(1.0)
+
+        # Brief sleep between attempts (but not too long - we want to retry quickly)
+        time.sleep(2.0)
 
     _log.error(
-        "CUDA not available after %s s grace; setting error state (no exit)",
-        grace_sec,
+        "CUDA not available after %s s grace (attempts=%d, hung_count=%d); setting error state (no exit)",
+        grace_sec, attempt, hung_count,
     )
-    print("CUDA not available after preflight grace; see diagnostics below (process continues).", flush=True)
+    print(
+        f"CUDA not available after preflight grace (attempts={attempt}, hung_count={hung_count}); "
+        f"see diagnostics below (process continues).",
+        flush=True
+    )
     _CUDA_ENV_INFO = env_info
     with _READY_LOCK:
         _READY["cuda_env"] = env_info
