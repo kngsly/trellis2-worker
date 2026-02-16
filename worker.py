@@ -1381,6 +1381,9 @@ def _cuda_empty_cache() -> None:
             torch.cuda.synchronize()  # finish pending work (helps after prior OOM)
             torch.cuda.empty_cache()
             gc.collect()
+            # Additional IPC cleanup to prevent memory fragmentation across generations
+            # (helps avoid corrupted mesh topology on reused instances - see GitHub issue #92)
+            torch.cuda.ipc_collect()
     except Exception:
         pass
 
@@ -1686,6 +1689,21 @@ def generate_glb_from_image_bytes_list(
                 if not out:
                     raise RuntimeError("pipeline.run() returned no outputs")
                 mesh = out[0]
+
+                # Validate mesh output to catch corrupted topology early
+                if not hasattr(mesh, "vertices") or not hasattr(mesh, "faces"):
+                    raise RuntimeError("pipeline output missing vertices or faces attributes")
+                try:
+                    vert_count = len(mesh.vertices) if hasattr(mesh.vertices, "__len__") else 0
+                    face_count = len(mesh.faces) if hasattr(mesh.faces, "__len__") else 0
+                    if vert_count == 0 or face_count == 0:
+                        raise RuntimeError(f"pipeline produced empty mesh: {vert_count} verts, {face_count} faces")
+                    # Sanity check: reasonable vertex/face ratio (typical meshes have faces ~= 2*verts)
+                    if face_count > vert_count * 10:
+                        print(f"[worker] WARNING: unusual mesh topology: {vert_count} verts, {face_count} faces (ratio {face_count/vert_count:.1f})", flush=True)
+                except Exception as e:
+                    print(f"[worker] WARNING: mesh validation check failed: {e}", flush=True)
+
                 # Log success with quality level info
                 if oom_quality_level > 0:
                     degradation_desc = []
@@ -1781,7 +1799,6 @@ def generate_glb_from_image_bytes_list(
                     # Level 7: Downscale input image to 768x768 (moderate reduction)
                     elif oom_quality_level == 7:
                         oom_quality_level = 8
-                        from PIL import Image
                         w, h = img0.size
                         max_dim = max(w, h)
                         if max_dim > 768:
@@ -1795,7 +1812,6 @@ def generate_glb_from_image_bytes_list(
                     # Level 8: Further downscale to 512x512
                     elif oom_quality_level == 8:
                         oom_quality_level = 9
-                        from PIL import Image
                         w, h = img0.size
                         max_dim = max(w, h)
                         if max_dim > 512:
@@ -1819,7 +1835,6 @@ def generate_glb_from_image_bytes_list(
                     # Level 10: Downscale to 384x384 as last resort before reducing texture to minimum
                     elif oom_quality_level == 10:
                         oom_quality_level = 11
-                        from PIL import Image
                         w, h = img0.size
                         max_dim = max(w, h)
                         if max_dim > 384:
@@ -1841,7 +1856,6 @@ def generate_glb_from_image_bytes_list(
                     # Level 12: Absolute minimum - tiny image with minimal steps
                     elif oom_quality_level == 12:
                         oom_quality_level = 13
-                        from PIL import Image
                         w, h = img0.size
                         max_dim = max(w, h)
                         if max_dim > 256:
@@ -1960,12 +1974,31 @@ def generate_glb_from_image_bytes_list(
                 })
             raise RuntimeError("to_glb failed") from last_glb_err
 
-        if export_meta is not None:
-            export_meta.update({
-                "oom_retries": oom_retries,
-                "to_glb_attempts": to_glb_attempts,
-                "decimation_final": int(decimation_target),
-            })
+        # Extract mesh statistics for debugging/monitoring
+        try:
+            glb_vert_count = len(glb.vertices) if hasattr(glb, "vertices") and hasattr(glb.vertices, "__len__") else 0
+            glb_face_count = len(glb.faces) if hasattr(glb, "faces") and hasattr(glb.faces, "__len__") else 0
+            print(
+                f"[worker] GLB export complete: {glb_vert_count} vertices, {glb_face_count} faces "
+                f"(decimation_target={decimation_target}, texture_size={texture_size})",
+                flush=True,
+            )
+            if export_meta is not None:
+                export_meta.update({
+                    "oom_retries": oom_retries,
+                    "to_glb_attempts": to_glb_attempts,
+                    "decimation_final": int(decimation_target),
+                    "glb_vertex_count": glb_vert_count,
+                    "glb_face_count": glb_face_count,
+                })
+        except Exception as e:
+            print(f"[worker] WARNING: failed to extract GLB mesh statistics: {e}", flush=True)
+            if export_meta is not None:
+                export_meta.update({
+                    "oom_retries": oom_retries,
+                    "to_glb_attempts": to_glb_attempts,
+                    "decimation_final": int(decimation_target),
+                })
 
         # Optional post-export axis scaling. This is intentionally Z-only so callers can
         # compensate for known vertical squash without touching X/Y proportions.
