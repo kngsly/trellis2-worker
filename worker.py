@@ -53,13 +53,201 @@ _READY = {
     "detail": "",
     "started_at": 0.0,
     "ready_at": 0.0,
+    "cuda_env": None,  # populated by _wait_for_cuda with driver/runtime/GPU info
 }
 _READY_LOCK = threading.Lock()
 _CUDA_RUNTIME_PREPARED = False
+_CUDA_ENV_INFO: Optional[dict] = None  # cached CUDA env info from preflight
 
 
 def _get_device():
     return os.environ.get("TRELLIS2_DEVICE", "cuda")
+
+
+def _find_nvidia_smi() -> Optional[Path]:
+    """Locate nvidia-smi binary."""
+    for p in ("/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi"):
+        pp = Path(p)
+        if pp.exists():
+            return pp
+    return None
+
+
+# Known minimum driver versions for each CUDA toolkit major.minor.
+# Source: https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/
+_CUDA_MIN_DRIVER: dict[str, int] = {
+    "12.8": 570,
+    "12.7": 565,
+    "12.6": 560,
+    "12.5": 555,
+    "12.4": 550,
+    "12.3": 545,
+    "12.2": 535,
+    "12.1": 530,
+    "12.0": 525,
+    "11.8": 520,
+    "11.7": 515,
+    "11.6": 510,
+    "11.5": 495,
+    "11.4": 470,
+    "11.3": 465,
+    "11.2": 460,
+    "11.1": 455,
+    "11.0": 450,
+}
+
+
+def _parse_driver_major(version_str: str) -> Optional[int]:
+    """Extract the major version number from a driver version string like '550.54.14'."""
+    try:
+        return int(version_str.strip().split(".")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _cuda_env_info() -> dict:
+    """
+    Gather comprehensive CUDA environment information for diagnostics and /ready.
+
+    Returns a dict with keys:
+      driver_version, cuda_runtime_version, torch_version, torch_cuda_available,
+      torch_cuda_arch_list, gpu_count, gpu_names, nvidia_smi_ok, nvidia_smi_output,
+      libcuda_ok, dev_nvidia, compat_ok, compat_error, error_803
+    """
+    info: dict = {
+        "driver_version": None,
+        "cuda_runtime_version": None,
+        "torch_version": None,
+        "torch_cuda_available": None,
+        "torch_cuda_arch_list": None,
+        "gpu_count": 0,
+        "gpu_names": [],
+        "nvidia_smi_ok": False,
+        "nvidia_smi_output": None,
+        "libcuda_ok": False,
+        "dev_nvidia": [],
+        "compat_ok": None,
+        "compat_error": None,
+        "error_803": False,
+    }
+
+    # /dev/nvidia* devices
+    try:
+        info["dev_nvidia"] = sorted(str(p) for p in Path("/dev").glob("nvidia*"))
+    except Exception:
+        pass
+
+    # libcuda.so availability
+    try:
+        ctypes.CDLL("libcuda.so.1")
+        info["libcuda_ok"] = True
+    except Exception:
+        pass
+
+    # nvidia-smi query (fast, ~1-2s)
+    smi = _find_nvidia_smi()
+    if smi:
+        try:
+            p = subprocess.run(
+                [str(smi), "--query-gpu=driver_version,name,memory.total,gpu_uuid",
+                 "--format=csv,noheader,nounits"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            out = (p.stdout or "").strip()
+            err = (p.stderr or "").strip()
+            if p.returncode == 0 and out:
+                info["nvidia_smi_ok"] = True
+                info["nvidia_smi_output"] = out[:1000]
+                # Parse first GPU line: "driver_version, name, memory, uuid"
+                for line in out.splitlines():
+                    parts = [x.strip() for x in line.split(",")]
+                    if len(parts) >= 2:
+                        if info["driver_version"] is None:
+                            info["driver_version"] = parts[0]
+                        info["gpu_names"].append(parts[1])
+                        info["gpu_count"] = len(info["gpu_names"])
+            else:
+                info["nvidia_smi_output"] = (err or f"rc={p.returncode}")[:500]
+                # Check for error 803 specifically
+                if "803" in (err or "") or "unsupported" in (err or "").lower():
+                    info["error_803"] = True
+                    info["compat_ok"] = False
+                    info["compat_error"] = (
+                        f"nvidia-smi error 803: system has unsupported display driver / "
+                        f"cuda driver combination. stderr={err[:300]}"
+                    )
+        except subprocess.TimeoutExpired:
+            info["nvidia_smi_output"] = "timeout (5s)"
+        except Exception as e:
+            info["nvidia_smi_output"] = f"error: {e!r}"
+
+    # Torch CUDA info
+    try:
+        import torch
+        info["torch_version"] = getattr(torch, "__version__", "unknown")
+        info["torch_cuda_arch_list"] = os.environ.get("TORCH_CUDA_ARCH_LIST")
+        cuda_ver = getattr(torch.version, "cuda", None)
+        info["cuda_runtime_version"] = cuda_ver
+        try:
+            info["torch_cuda_available"] = torch.cuda.is_available()
+            info["gpu_count"] = max(info["gpu_count"], torch.cuda.device_count())
+        except Exception:
+            info["torch_cuda_available"] = False
+    except ImportError:
+        pass
+
+    # Driver/runtime compatibility check
+    if info["driver_version"] and info["cuda_runtime_version"] and not info["error_803"]:
+        driver_major = _parse_driver_major(info["driver_version"])
+        cuda_rt = info["cuda_runtime_version"]
+        # Extract major.minor from runtime version like "12.4"
+        cuda_mm = ".".join(cuda_rt.split(".")[:2]) if cuda_rt else None
+        if driver_major is not None and cuda_mm and cuda_mm in _CUDA_MIN_DRIVER:
+            min_driver = _CUDA_MIN_DRIVER[cuda_mm]
+            if driver_major < min_driver:
+                info["compat_ok"] = False
+                info["compat_error"] = (
+                    f"Driver {info['driver_version']} (major={driver_major}) is too old for "
+                    f"CUDA runtime {cuda_rt}. Minimum driver major version: {min_driver}."
+                )
+            else:
+                info["compat_ok"] = True
+        else:
+            # Can't determine compatibility; assume OK and let torch.cuda.is_available() decide
+            info["compat_ok"] = True
+
+    return info
+
+
+def _log_cuda_env(info: dict) -> None:
+    """Log CUDA environment info in a readable format."""
+    lines = [
+        "--- CUDA environment info ---",
+        f"  driver_version:       {info.get('driver_version') or 'unknown'}",
+        f"  cuda_runtime_version: {info.get('cuda_runtime_version') or 'unknown'}",
+        f"  torch_version:        {info.get('torch_version') or 'unknown'}",
+        f"  torch_cuda_available: {info.get('torch_cuda_available')}",
+        f"  gpu_count:            {info.get('gpu_count', 0)}",
+        f"  gpu_names:            {info.get('gpu_names', [])}",
+        f"  nvidia_smi_ok:        {info.get('nvidia_smi_ok', False)}",
+        f"  libcuda_ok:           {info.get('libcuda_ok', False)}",
+        f"  dev_nvidia:           {info.get('dev_nvidia', [])}",
+        f"  compat_ok:            {info.get('compat_ok')}",
+    ]
+    if info.get("compat_error"):
+        lines.append(f"  compat_error:         {info['compat_error']}")
+    if info.get("error_803"):
+        lines.append("  error_803:            True (driver/runtime mismatch)")
+    lines.append("--- end CUDA environment info ---")
+    for line in lines:
+        _log.info(line)
+    # Also print to stdout for external systems (rent.py)
+    for line in lines:
+        print(line, flush=True)
 
 
 def _cuda_failure_diagnostics() -> None:
@@ -90,13 +278,11 @@ def _cuda_failure_diagnostics() -> None:
     except Exception as e:
         lines.append(f"libcuda.so.1: dlopen failed ({e!r})")
 
-    nvidia_smi = Path("/usr/bin/nvidia-smi")
-    if not nvidia_smi.exists():
-        nvidia_smi = Path("/usr/local/bin/nvidia-smi")
-    if nvidia_smi.exists():
+    smi = _find_nvidia_smi()
+    if smi:
         try:
             p = subprocess.run(
-                [str(nvidia_smi), "-L"],
+                [str(smi), "-L"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -126,18 +312,61 @@ def _wait_for_cuda(grace_sec: int) -> bool:
     Wait up to grace_sec for CUDA to become available (TRELLIS2_DEVICE=cuda only).
     Returns True if CUDA is available, False otherwise. Never exits the process;
     caller (e.g. preload worker) should set error state and continue serving /ready.
+
+    Fast-fail: if driver/runtime incompatibility is detected (e.g. error 803),
+    fails within ~10s instead of polling for the full grace period.
     """
+    global _CUDA_ENV_INFO
     if _get_device().lower() != "cuda":
         _log.info("CUDA preflight skipped (TRELLIS2_DEVICE!=cuda)")
         return True
+
+    # Phase 1: fast environment check (~5s). Detect driver/runtime mismatch before
+    # entering the slow polling loop. This catches error 803 and similar issues.
+    _log.info("CUDA preflight phase 1: checking driver/runtime compatibility")
+    with _READY_LOCK:
+        _READY["detail"] = "checking driver/runtime compatibility"
+    env_info = _cuda_env_info()
+    _CUDA_ENV_INFO = env_info
+    _log_cuda_env(env_info)
+
+    # Fast-fail on known-incompatible configurations
+    if env_info.get("compat_ok") is False:
+        compat_err = env_info.get("compat_error", "driver/runtime incompatible")
+        _log.error("CUDA preflight FAST FAIL: %s", compat_err)
+        print(f"CUDA preflight FAST FAIL: {compat_err}", flush=True)
+        with _READY_LOCK:
+            _READY["detail"] = f"CUDA driver incompatible: {compat_err}"
+            _READY["cuda_env"] = env_info
+        _cuda_failure_diagnostics()
+        return False
+
+    # Fast-fail if nvidia-smi is present but no GPUs found and no /dev/nvidia* devices
+    if not env_info.get("nvidia_smi_ok") and not env_info.get("dev_nvidia"):
+        smi = _find_nvidia_smi()
+        if smi is not None:
+            _log.error("CUDA preflight FAST FAIL: nvidia-smi present but failed; no /dev/nvidia* devices")
+            print("CUDA preflight FAST FAIL: nvidia-smi present but failed; no GPU devices visible", flush=True)
+            with _READY_LOCK:
+                _READY["detail"] = "no GPU devices visible (nvidia-smi failed, no /dev/nvidia*)"
+                _READY["cuda_env"] = env_info
+            _cuda_failure_diagnostics()
+            return False
+
+    # Phase 2: poll torch.cuda.is_available() with reduced timeout if driver looks OK
+    fast_fail_sec = max(10, min(15, int(os.environ.get("CUDA_FAST_FAIL_SEC", "15") or "15")))
     _log.info(
-        "CUDA preflight waiting up to %s s for device (min %s s for robustness)",
-        grace_sec,
-        _MIN_STARTUP_WAIT_SEC,
+        "CUDA preflight phase 2: waiting up to %s s for torch CUDA init "
+        "(fast-fail after %s s if no progress, full grace %s s)",
+        grace_sec, fast_fail_sec, grace_sec,
     )
+    with _READY_LOCK:
+        _READY["detail"] = "waiting for torch CUDA initialization"
     deadline = time.time() + grace_sec
+    fast_fail_deadline = time.time() + fast_fail_sec
     last_log = 0.0
-    log_interval = 60.0
+    log_interval = 15.0  # Log more frequently for debugging
+    first_torch_error: Optional[str] = None
 
     while time.time() < deadline:
         try:
@@ -146,15 +375,64 @@ def _wait_for_cuda(grace_sec: int) -> bool:
                 try:
                     name = torch.cuda.get_device_name(0)
                     _log.info("CUDA preflight ok: %s", name)
+                    # Update env info with successful torch init
+                    env_info["torch_cuda_available"] = True
+                    try:
+                        env_info["gpu_count"] = torch.cuda.device_count()
+                        env_info["gpu_names"] = [
+                            torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
+                        ]
+                    except Exception:
+                        pass
+                    _CUDA_ENV_INFO = env_info
+                    with _READY_LOCK:
+                        _READY["cuda_env"] = env_info
                     return True
                 except Exception:
                     pass
         except ImportError:
             pass
+        except Exception as e:
+            # Capture the first torch CUDA error for fast-fail analysis
+            if first_torch_error is None:
+                first_torch_error = str(e)
+                _log.warning("CUDA preflight: torch error on first attempt: %s", first_torch_error)
+
         now = time.time()
+
+        # Fast-fail check: if we're past the fast-fail deadline and torch has reported an error
+        # that looks like a driver mismatch, bail out immediately
+        if now > fast_fail_deadline and first_torch_error:
+            err_lower = first_torch_error.lower()
+            fast_fail_markers = (
+                "803", "unsupported display driver", "cuda driver version is insufficient",
+                "no cuda gpus are available", "cuda error",
+                "forward compatibility was attempted on non supported hw",
+            )
+            if any(m in err_lower for m in fast_fail_markers):
+                _log.error(
+                    "CUDA preflight FAST FAIL after %ds: torch reported driver issue: %s",
+                    fast_fail_sec, first_torch_error,
+                )
+                print(
+                    f"CUDA preflight FAST FAIL: torch CUDA init error (likely driver mismatch): "
+                    f"{first_torch_error[:300]}",
+                    flush=True,
+                )
+                env_info["compat_ok"] = False
+                env_info["compat_error"] = first_torch_error[:500]
+                _CUDA_ENV_INFO = env_info
+                with _READY_LOCK:
+                    _READY["detail"] = f"CUDA init failed: {first_torch_error[:200]}"
+                    _READY["cuda_env"] = env_info
+                _cuda_failure_diagnostics()
+                return False
+
         if now - last_log >= log_interval:
             remaining = max(0, int(deadline - now))
             _log.info("CUDA preflight still waiting for device (~%s s remaining)", remaining)
+            with _READY_LOCK:
+                _READY["detail"] = f"waiting for CUDA device (~{remaining}s remaining)"
             last_log = now
         if now + 1.0 > deadline:
             break
@@ -165,6 +443,9 @@ def _wait_for_cuda(grace_sec: int) -> bool:
         grace_sec,
     )
     print("CUDA not available after preflight grace; see diagnostics below (process continues).", flush=True)
+    _CUDA_ENV_INFO = env_info
+    with _READY_LOCK:
+        _READY["cuda_env"] = env_info
     _cuda_failure_diagnostics()
     return False
 
@@ -278,6 +559,11 @@ def _is_probably_driver_runtime_error(exc: BaseException) -> bool:
         "cuda unknown error",
         "forward compatibility was attempted on non supported hw",
         "libcuda",
+        "803",  # error 803: unsupported display driver / cuda driver combination
+        "unsupported display driver",
+        "cuda driver version is insufficient",
+        "no cuda gpus are available",
+        "driver/library version mismatch",
     )
     return any(m in s for m in markers)
 
@@ -549,6 +835,11 @@ def get_ready_state() -> dict:
         return dict(_READY)
 
 
+def get_cuda_env_info() -> Optional[dict]:
+    """Return cached CUDA environment info gathered during preflight, or None if not yet run."""
+    return _CUDA_ENV_INFO
+
+
 def _preload_heartbeat(interval_sec: float, started_at: float) -> None:
     """Log progress every interval_sec while preload is still loading/downloading."""
     while True:
@@ -567,6 +858,8 @@ def _preload_heartbeat(interval_sec: float, started_at: float) -> None:
 def _preload_worker():
     global _PIPELINE
     # CUDA check runs in background after server is up; no process exit, just error state if unavailable.
+    # With the fast-fail mechanism in _wait_for_cuda, driver incompatibility is detected in ~10-15s.
+    # The grace_sec is the *maximum* wait; actual failure may be much faster.
     raw = str(os.environ.get("CUDA_PREFLIGHT_GRACE_SEC", str(_MIN_STARTUP_WAIT_SEC)) or str(_MIN_STARTUP_WAIT_SEC)).strip()
     try:
         requested = int(raw)
@@ -574,9 +867,14 @@ def _preload_worker():
     except ValueError:
         grace_sec = _MIN_STARTUP_WAIT_SEC
     if not _wait_for_cuda(grace_sec):
+        env_info = _CUDA_ENV_INFO or {}
+        err_detail = env_info.get("compat_error", "")
         with _READY_LOCK:
             _READY["status"] = "error"
-            _READY["detail"] = "CUDA not available after preflight grace (see logs). Process continues; /ready will report not ready."
+            if err_detail:
+                _READY["detail"] = f"CUDA driver incompatible: {err_detail[:300]}"
+            else:
+                _READY["detail"] = "CUDA not available after preflight grace (see logs). Process continues; /ready will report not ready."
         _log.error("preload: aborting (CUDA unavailable); server remains up for /health and /ready")
         return
 
