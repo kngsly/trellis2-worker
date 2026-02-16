@@ -43,7 +43,9 @@ RUN ln -sf /usr/bin/python3.10 /usr/bin/python && ln -sf /usr/bin/pip3 /usr/bin/
 RUN python -m pip install --upgrade pip setuptools wheel
 
 # Torch first (CUDA 13.0)
-RUN pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu130
+# Use --extra-index-url instead of --index-url to ensure cuda-bindings==13.0.3 can be found
+# See: https://github.com/pytorch/pytorch/issues/172926
+RUN pip install torch==2.10.0 torchvision==0.25.0 --extra-index-url https://download.pytorch.org/whl/cu130
 
 # TRELLIS.2 sparse attention defaults to flash-attn; install it so /generate doesn't crash.
 # See: https://github.com/Dao-AILab/flash-attention#installation-and-features
