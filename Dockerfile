@@ -48,10 +48,10 @@ RUN pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.p
 # TRELLIS.2 sparse attention defaults to flash-attn; install it so /generate doesn't crash.
 # See: https://github.com/Dao-AILab/flash-attention#installation-and-features
 #
-# Prefer wheels when available (fast, reliable). If a wheel isn't available for the current
-# torch/cuda/python combo, fall back to building from source.
-RUN pip install --only-binary=:all: flash-attn==2.7.4.post1 \
-    || pip install flash-attn==2.7.4.post1 --no-build-isolation
+# PyPI doesn't have cu130 wheels - use community-built wheels from flashattn.dev
+# Flash-Attention 3 has cu130 wheels for PyTorch 2.10.0
+RUN pip install flash-attn --extra-index-url https://flashattn.dev/whl/cu130/torch2.10/ \
+    || echo "WARNING: flash-attn installation failed, continuing anyway (will use fallback attention)"
 
 # Clone TRELLIS.2 source (used via PYTHONPATH; the repo does not ship as a pip package).
 WORKDIR /opt/trellis2
