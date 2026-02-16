@@ -1673,6 +1673,10 @@ def generate_glb_from_image_bytes_list(
         max_attempts = max(1, retries)
         img0 = primary_img
         oom_run_retried = False
+        oom_quality_level = 0  # Track quality degradation level for OOM fallbacks
+        original_kwargs = dict(kwargs)  # Save original settings for OOM fallback
+        original_img_size = img0.size  # Save original image size
+
         while True:
             try:
                 torch.manual_seed(int(seed) + attempt)
@@ -1682,15 +1686,185 @@ def generate_glb_from_image_bytes_list(
                 if not out:
                     raise RuntimeError("pipeline.run() returned no outputs")
                 mesh = out[0]
+                # Log success with quality level info
+                if oom_quality_level > 0:
+                    degradation_desc = []
+                    if "sparse_structure_sampler_params" in kwargs:
+                        degradation_desc.append(f"ss_steps={kwargs['sparse_structure_sampler_params'].get('steps', '?')}")
+                    if "shape_slat_sampler_params" in kwargs:
+                        degradation_desc.append(f"shape_steps={kwargs['shape_slat_sampler_params'].get('steps', '?')}")
+                    if "tex_slat_sampler_params" in kwargs:
+                        degradation_desc.append(f"tex_steps={kwargs['tex_slat_sampler_params'].get('steps', '?')}")
+                    print(
+                        f"[worker] pipe.run succeeded with quality degradation level {oom_quality_level} "
+                        f"(pipeline_type={ptype}, {', '.join(degradation_desc)})",
+                        flush=True,
+                    )
                 break
             except Exception as e:
                 last_err = e
-                # One-time retry on CUDA OOM (e.g. reused instance with fragmented VRAM).
-                if _is_cuda_oom(e) and not oom_run_retried:
-                    oom_run_retried = True
+                # Progressive OOM handling: preserve texture quality as long as possible
+                if _is_cuda_oom(e):
                     _cuda_empty_cache()
-                    print("[worker] pipe.run OOM, clearing cache and retrying once", flush=True)
-                    continue
+
+                    # Level 0: Simple cache clear
+                    if oom_quality_level == 0:
+                        oom_quality_level = 1
+                        print("[worker] pipe.run OOM (level 0), clearing cache and retrying", flush=True)
+                        continue
+
+                    # Level 1: Reduce sparse_structure steps by 50% (preserves shape & texture quality)
+                    elif oom_quality_level == 1:
+                        oom_quality_level = 2
+                        if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs["sparse_structure_sampler_params"], dict):
+                            orig_steps = kwargs["sparse_structure_sampler_params"].get("steps", 12)
+                            new_steps = max(4, orig_steps // 2)
+                            kwargs["sparse_structure_sampler_params"]["steps"] = new_steps
+                            print(f"[worker] pipe.run OOM (level 1), reducing sparse_structure steps {orig_steps}→{new_steps}", flush=True)
+                        continue
+
+                    # Level 2: Reduce shape_slat steps by 50% (preserves texture quality)
+                    elif oom_quality_level == 2:
+                        oom_quality_level = 3
+                        if "shape_slat_sampler_params" in kwargs and isinstance(kwargs["shape_slat_sampler_params"], dict):
+                            orig_steps = kwargs["shape_slat_sampler_params"].get("steps", 12)
+                            new_steps = max(4, orig_steps // 2)
+                            kwargs["shape_slat_sampler_params"]["steps"] = new_steps
+                            print(f"[worker] pipe.run OOM (level 2), reducing shape_slat steps {orig_steps}→{new_steps}", flush=True)
+                        continue
+
+                    # Level 3: Switch from cascade to non-cascade pipeline (if applicable)
+                    elif oom_quality_level == 3 and ptype and "cascade" in ptype.lower():
+                        oom_quality_level = 4
+                        fallback_ptype = ptype.replace("_cascade", "").replace("cascade_", "")
+                        print(f"[worker] pipe.run OOM (level 3), switching from {ptype} to {fallback_ptype}", flush=True)
+                        if "pipeline_type" in kwargs:
+                            kwargs["pipeline_type"] = fallback_ptype
+                        ptype = fallback_ptype
+                        # Restore original steps for the new pipeline (give it a fresh chance)
+                        if "sparse_structure_sampler_params" in kwargs and "sparse_structure_sampler_params" in original_kwargs:
+                            kwargs["sparse_structure_sampler_params"]["steps"] = original_kwargs["sparse_structure_sampler_params"].get("steps", 12)
+                        if "shape_slat_sampler_params" in kwargs and "shape_slat_sampler_params" in original_kwargs:
+                            kwargs["shape_slat_sampler_params"]["steps"] = original_kwargs["shape_slat_sampler_params"].get("steps", 12)
+                        if "tex_slat_sampler_params" in kwargs and "tex_slat_sampler_params" in original_kwargs:
+                            kwargs["tex_slat_sampler_params"]["steps"] = original_kwargs["tex_slat_sampler_params"].get("steps", 12)
+                        continue
+
+                    # Level 4: Reduce sparse_structure to minimum (still preserving shape & texture)
+                    elif oom_quality_level in (3, 4):
+                        oom_quality_level = 5
+                        if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs["sparse_structure_sampler_params"], dict):
+                            kwargs["sparse_structure_sampler_params"]["steps"] = 4
+                            print("[worker] pipe.run OOM (level 4), sparse_structure steps→4", flush=True)
+                        continue
+
+                    # Level 5: Reduce shape_slat to minimum (still preserving texture)
+                    elif oom_quality_level == 5:
+                        oom_quality_level = 6
+                        if "shape_slat_sampler_params" in kwargs and isinstance(kwargs["shape_slat_sampler_params"], dict):
+                            kwargs["shape_slat_sampler_params"]["steps"] = 4
+                            print("[worker] pipe.run OOM (level 5), shape_slat steps→4", flush=True)
+                        continue
+
+                    # Level 6: Switch to 512 pipeline (lower resolution but keep texture quality)
+                    elif oom_quality_level in (3, 4, 5, 6) and ptype != "512":
+                        oom_quality_level = 7
+                        print(f"[worker] pipe.run OOM (level 6), switching from {ptype} to 512 pipeline", flush=True)
+                        if "pipeline_type" in kwargs:
+                            kwargs["pipeline_type"] = "512"
+                        ptype = "512"
+                        # Restore original texture steps (keep texture quality high)
+                        if "tex_slat_sampler_params" in kwargs and "tex_slat_sampler_params" in original_kwargs:
+                            kwargs["tex_slat_sampler_params"]["steps"] = original_kwargs["tex_slat_sampler_params"].get("steps", 12)
+                        continue
+
+                    # Level 7: Downscale input image to 768x768 (moderate reduction)
+                    elif oom_quality_level == 7:
+                        oom_quality_level = 8
+                        from PIL import Image
+                        w, h = img0.size
+                        max_dim = max(w, h)
+                        if max_dim > 768:
+                            scale = 768.0 / max_dim
+                            new_w = int(w * scale)
+                            new_h = int(h * scale)
+                            img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                            print(f"[worker] pipe.run OOM (level 7), downscaled image {w}x{h}→{new_w}x{new_h}", flush=True)
+                        continue
+
+                    # Level 8: Further downscale to 512x512
+                    elif oom_quality_level == 8:
+                        oom_quality_level = 9
+                        from PIL import Image
+                        w, h = img0.size
+                        max_dim = max(w, h)
+                        if max_dim > 512:
+                            scale = 512.0 / max_dim
+                            new_w = int(w * scale)
+                            new_h = int(h * scale)
+                            img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                            print(f"[worker] pipe.run OOM (level 8), downscaled image {w}x{h}→{new_w}x{new_h}", flush=True)
+                        continue
+
+                    # Level 9: NOW reduce texture steps by 50% (only after exhausting other options)
+                    elif oom_quality_level == 9:
+                        oom_quality_level = 10
+                        if "tex_slat_sampler_params" in kwargs and isinstance(kwargs["tex_slat_sampler_params"], dict):
+                            orig_steps = kwargs["tex_slat_sampler_params"].get("steps", 12)
+                            new_steps = max(4, orig_steps // 2)
+                            kwargs["tex_slat_sampler_params"]["steps"] = new_steps
+                            print(f"[worker] pipe.run OOM (level 9), reducing tex_slat steps {orig_steps}→{new_steps}", flush=True)
+                        continue
+
+                    # Level 10: Downscale to 384x384 as last resort before reducing texture to minimum
+                    elif oom_quality_level == 10:
+                        oom_quality_level = 11
+                        from PIL import Image
+                        w, h = img0.size
+                        max_dim = max(w, h)
+                        if max_dim > 384:
+                            scale = 384.0 / max_dim
+                            new_w = int(w * scale)
+                            new_h = int(h * scale)
+                            img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                            print(f"[worker] pipe.run OOM (level 10), downscaled image {w}x{h}→{new_w}x{new_h}", flush=True)
+                        continue
+
+                    # Level 11: Final resort - reduce texture to minimum
+                    elif oom_quality_level == 11:
+                        oom_quality_level = 12
+                        if "tex_slat_sampler_params" in kwargs and isinstance(kwargs["tex_slat_sampler_params"], dict):
+                            kwargs["tex_slat_sampler_params"]["steps"] = 4
+                            print("[worker] pipe.run OOM (level 11), tex_slat steps→4", flush=True)
+                        continue
+
+                    # Level 12: Absolute minimum - tiny image with minimal steps
+                    elif oom_quality_level == 12:
+                        oom_quality_level = 13
+                        from PIL import Image
+                        w, h = img0.size
+                        max_dim = max(w, h)
+                        if max_dim > 256:
+                            scale = 256.0 / max_dim
+                            new_w = int(w * scale)
+                            new_h = int(h * scale)
+                            img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                            print(f"[worker] pipe.run OOM (level 12), downscaled to absolute minimum {w}x{h}→{new_w}x{new_h}", flush=True)
+                        # Force all to minimum
+                        if "sparse_structure_sampler_params" in kwargs:
+                            kwargs["sparse_structure_sampler_params"]["steps"] = 2
+                        if "shape_slat_sampler_params" in kwargs:
+                            kwargs["shape_slat_sampler_params"]["steps"] = 2
+                        if "tex_slat_sampler_params" in kwargs:
+                            kwargs["tex_slat_sampler_params"]["steps"] = 2
+                        continue
+
+                    # Level 13+: All fallbacks exhausted
+                    else:
+                        print("[worker] pipe.run OOM after all 13 quality degradation attempts", flush=True)
+                        raise RuntimeError("Worker ran out of memory, model was too complex.") from e
+
+                # Handle non-OOM errors
                 if not _is_empty_sparse_error(e):
                     raise
 
@@ -1727,7 +1901,15 @@ def generate_glb_from_image_bytes_list(
                 "texture_size": int(texture_size),
                 "decimation_initial": decimation_initial,
                 "input_image_count": len(images_bytes),
+                "oom_quality_degradation_level": oom_quality_level,
             })
+            # Track actual sampler steps used (after OOM degradation)
+            if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs.get("sparse_structure_sampler_params"), dict):
+                export_meta["sparse_structure_steps"] = kwargs["sparse_structure_sampler_params"].get("steps")
+            if "shape_slat_sampler_params" in kwargs and isinstance(kwargs.get("shape_slat_sampler_params"), dict):
+                export_meta["shape_slat_steps"] = kwargs["shape_slat_sampler_params"].get("steps")
+            if "tex_slat_sampler_params" in kwargs and isinstance(kwargs.get("tex_slat_sampler_params"), dict):
+                export_meta["tex_slat_steps"] = kwargs["tex_slat_sampler_params"].get("steps")
 
         for attempt in range(_int_env("TRELLIS2_TO_GLB_OOM_RETRIES", 4)):
             to_glb_attempts = attempt + 1
