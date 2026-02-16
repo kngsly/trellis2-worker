@@ -41,6 +41,7 @@ from worker import (
     generate_glb_from_image_bytes_list,
     get_ready_state,
     start_preload_in_background,
+    get_cuda_env_info,
 )
 
 _log.info("worker module loaded")
@@ -83,7 +84,15 @@ def health():
 def ready():
     st = get_ready_state()
     ok = st.get("status") == "ready"
-    return JSONResponse({"ready": bool(ok), **st}, status_code=200)
+    resp = {"ready": bool(ok), **st}
+    # Include CUDA environment info if available (driver version, GPU, compat status).
+    # The cuda_env field may already be in st from _READY; also include the cached
+    # env info if the preflight has run.
+    if resp.get("cuda_env") is None:
+        cuda_info = get_cuda_env_info()
+        if cuda_info is not None:
+            resp["cuda_env"] = cuda_info
+    return JSONResponse(resp, status_code=200)
 
 
 def _parse_bool(v: Optional[str], default: bool = False) -> bool:
