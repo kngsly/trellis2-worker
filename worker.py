@@ -313,19 +313,28 @@ def _try_torch_cuda_with_timeout(timeout_sec: float) -> tuple[bool, Optional[str
     torch.cuda.is_available() can hang indefinitely on certain driver states,
     so we need a thread-based timeout wrapper.
 
+    Also captures warnings (like Error 803) that appear during CUDA initialization.
+
     Returns: (success: bool, error_msg: Optional[str])
       - (True, None) if CUDA is available
       - (False, "timeout") if the call didn't complete within timeout_sec
-      - (False, error_msg) if torch.cuda.is_available() raised an exception
+      - (False, error_msg) if torch.cuda.is_available() raised an exception or warning
     """
-    result = {"available": False, "error": None, "done": False}
+    result = {"available": False, "error": None, "done": False, "warnings": []}
 
     def _check_cuda():
+        import warnings
         try:
-            import torch
-            available = torch.cuda.is_available()
-            result["available"] = available
-            result["done"] = True
+            # Capture warnings (Error 803 appears as a UserWarning)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                import torch
+                available = torch.cuda.is_available()
+                result["available"] = available
+                # Store warning messages
+                if w:
+                    result["warnings"] = [str(warn.message) for warn in w]
+                result["done"] = True
         except Exception as e:
             result["error"] = str(e)
             result["done"] = True
@@ -337,6 +346,14 @@ def _try_torch_cuda_with_timeout(timeout_sec: float) -> tuple[bool, Optional[str
     if not result["done"]:
         # Thread didn't finish - torch.cuda.is_available() is hung
         return (False, "timeout")
+
+    # Check for Error 803 in warnings first (most common case)
+    if result.get("warnings"):
+        for warn_msg in result["warnings"]:
+            warn_lower = warn_msg.lower()
+            if "803" in warn_lower or "unsupported display driver" in warn_lower or "cuda driver combination" in warn_lower:
+                # Return the warning as an error so it triggers fast-fail
+                return (False, f"Error 803 warning: {warn_msg[:300]}")
 
     if result["error"] is not None:
         return (False, result["error"])
@@ -411,6 +428,7 @@ def _wait_for_cuda(grace_sec: int) -> bool:
     log_interval = 10.0  # Log every 10s for better visibility
     first_torch_error: Optional[str] = None
     hung_count = 0  # Track how many times torch.cuda.is_available() hung
+    unavailable_count = 0  # Track how many times CUDA was unavailable (False, not error/hung)
 
     attempt = 0
     while time.time() < deadline:
@@ -456,6 +474,51 @@ def _wait_for_cuda(grace_sec: int) -> bool:
                     first_torch_error = error_msg
                     _log.warning("CUDA preflight: torch error on attempt #%d: %s", attempt, first_torch_error)
                     print(f"[worker] CUDA preflight: torch error: {first_torch_error[:200]}", flush=True)
+                # Fast-fail on Error 803 (even if it's in a warning, not an exception)
+                # Error 803 means the driver/runtime combo is incompatible at the ABI/API level
+                err_lower = error_msg.lower()
+                if "803" in err_lower or "unsupported display driver" in err_lower:
+                    _log.error("CUDA preflight FAST FAIL: Error 803 detected (driver/runtime incompatible)")
+                    print(
+                        f"CUDA preflight FAST FAIL: Error 803 detected in torch error message. "
+                        f"Driver/runtime incompatible at ABI/API level.",
+                        flush=True
+                    )
+                    env_info["compat_ok"] = False
+                    env_info["compat_error"] = f"Error 803: {error_msg[:300]}"
+                    env_info["error_803"] = True
+                    _CUDA_ENV_INFO = env_info
+                    with _READY_LOCK:
+                        _READY["detail"] = "CUDA Error 803 (driver/runtime incompatible)"
+                        _READY["cuda_env"] = env_info
+                    _cuda_failure_diagnostics()
+                    return False
+
+            # If torch.cuda.is_available() returns False (not error, not hung, just False),
+            # this usually means Error 803 or similar driver issue. After 3 consecutive
+            # False returns within fast_fail window, give up.
+            if not success and error_msg is None:
+                unavailable_count += 1
+                if unavailable_count >= 3 and time.time() < fast_fail_deadline + 10:
+                    # Within extended fast-fail window, if CUDA consistently unavailable, bail
+                    _log.error(
+                        "CUDA preflight FAST FAIL: torch.cuda.is_available() returned False %d times "
+                        "(driver issue likely, e.g. Error 803)",
+                        unavailable_count
+                    )
+                    print(
+                        f"CUDA preflight FAST FAIL: torch.cuda.is_available() returned False {unavailable_count} times. "
+                        f"Driver/runtime likely incompatible (Error 803 or similar).",
+                        flush=True
+                    )
+                    env_info["compat_ok"] = False
+                    env_info["compat_error"] = "torch.cuda.is_available() consistently False (likely Error 803)"
+                    _CUDA_ENV_INFO = env_info
+                    with _READY_LOCK:
+                        _READY["detail"] = "CUDA consistently unavailable (driver issue)"
+                        _READY["cuda_env"] = env_info
+                    _cuda_failure_diagnostics()
+                    return False
 
             if success:
                 # CUDA is available! Verify we can get device name

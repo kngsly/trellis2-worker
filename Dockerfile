@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
 
 ARG TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9"
 ARG BUILD_JOBS="2"
@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ninja-build pkg-config \
       libgl1-mesa-glx libglib2.0-0 libsm6 libxrender1 libxext6 \
       libjpeg-dev \
-      cuda-compat-12-4 \
+      cuda-compat-13-0 \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
@@ -42,8 +42,8 @@ RUN ln -sf /usr/bin/python3.10 /usr/bin/python && ln -sf /usr/bin/pip3 /usr/bin/
 # Keep build tooling current; some sdists (flash-attn) fail metadata generation on older pip/setuptools.
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# Torch first (CUDA 12.4)
-RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+# Torch first (CUDA 13.0)
+RUN pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu130
 
 # TRELLIS.2 sparse attention defaults to flash-attn; install it so /generate doesn't crash.
 # See: https://github.com/Dao-AILab/flash-attention#installation-and-features
