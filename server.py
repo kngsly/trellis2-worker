@@ -13,12 +13,14 @@ Response shape mirrors other workers so a client can reuse the same protocol.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import logging
 import os
 import sys
 import traceback
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import List, Optional
 
@@ -162,16 +164,21 @@ async def generate(
         if not raw_list:
             return JSONResponse({"success": False, "error": "empty upload(s)"}, status_code=200)
 
-        out_path = generate_glb_from_image_bytes_list(
-            raw_list,
-            out_dir=OUTPUT_DIR,
-            low_poly=want_low_poly,
-            seed=safe_seed,
-            pipeline_type=str(pipeline_type).strip() if pipeline_type else None,
-            preprocess_image=want_preprocess,
-            post_scale_z=want_post_scale_z,
-            backup_inputs=want_backup,
-            export_meta=export_meta,
+        # Run the blocking CUDA generation in a thread so the event loop stays
+        # responsive for /health and /ready probes during long jobs.
+        out_path = await asyncio.to_thread(
+            partial(
+                generate_glb_from_image_bytes_list,
+                raw_list,
+                out_dir=OUTPUT_DIR,
+                low_poly=want_low_poly,
+                seed=safe_seed,
+                pipeline_type=str(pipeline_type).strip() if pipeline_type else None,
+                preprocess_image=want_preprocess,
+                post_scale_z=want_post_scale_z,
+                backup_inputs=want_backup,
+                export_meta=export_meta,
+            )
         )
         resp = {"success": True, "glb_path": str(out_path)}
         if export_meta:
