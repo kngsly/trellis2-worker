@@ -69,6 +69,7 @@ ENV PYTHONPATH=/opt/trellis2/src
 # - Robust alpha bbox cropping (avoid empty bbox when alpha is soft/empty)
 # - Guard against empty sparse coords (raise a clearer error instead of crashing deeper in sparse ops)
 # - Postprocess cleanup after remesh (reduce floaters / disconnected components in exported meshes)
+# - Add 'sdpa' (PyTorch native) backend to sparse attention so flash_attn is optional
 RUN python - <<'PY'
 from __future__ import annotations
 
@@ -216,6 +217,73 @@ def patch_ovoxel_cleanup(s: str) -> str:
 
 patched = patch_file(ov, patch_ovoxel_cleanup)
 print(f"Patched o_voxel remesh cleanup: {patched}")
+
+# 6) Add 'sdpa' to sparse attention config valid backends
+sparse_cfg = root / "trellis2" / "modules" / "sparse" / "config.py"
+sparse_cfg_marker = "# trellis2-worker build patch: add sdpa to sparse attn backends"
+def patch_sparse_cfg(s: str) -> str:
+    if sparse_cfg_marker in s:
+        return s
+    needle = "['xformers', 'flash_attn', 'flash_attn_3']"
+    if needle not in s:
+        print("WARN: sparse config backend list not found; skipping sdpa config patch")
+        return s
+    repl = f"['xformers', 'flash_attn', 'flash_attn_3', 'sdpa']  {sparse_cfg_marker}"
+    return s.replace(needle, repl, 1)
+
+patched = patch_file(sparse_cfg, patch_sparse_cfg)
+print(f"Patched sparse config sdpa backend: {patched}")
+
+# 7) Add 'sdpa' branch to sparse attention full_attn.py
+sparse_attn = root / "trellis2" / "modules" / "sparse" / "attention" / "full_attn.py"
+sparse_attn_marker = "# trellis2-worker build patch: sdpa backend for sparse attention"
+def patch_sparse_attn(s: str) -> str:
+    if sparse_attn_marker in s:
+        return s
+    # Insert sdpa branch before the else/raise ValueError
+    needle = "    else:\n        raise ValueError(f\"Unknown attention module: {config.ATTN}\")"
+    if needle not in s:
+        print("WARN: sparse attn raise ValueError not found; skipping sdpa attn patch")
+        return s
+    sdpa_branch = f'''\
+    elif config.ATTN == 'sdpa':
+        {sparse_attn_marker}
+        from torch.nn.functional import scaled_dot_product_attention as _sdpa
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        N = len(q_seqlen)
+        H = q.shape[-2]
+        max_q = max(q_seqlen)
+        max_kv = max(kv_seqlen)
+        C_q = q.shape[-1]
+        C_k = k.shape[-1]
+        C_v = v.shape[-1]
+        q_pad = q.new_zeros(N, max_q, H, C_q)
+        k_pad = k.new_zeros(N, max_kv, H, C_k)
+        v_pad = v.new_zeros(N, max_kv, H, C_v)
+        oq = ok = 0
+        for i in range(N):
+            ql, kvl = q_seqlen[i], kv_seqlen[i]
+            q_pad[i, :ql] = q[oq:oq+ql]; oq += ql
+            k_pad[i, :kvl] = k[ok:ok+kvl]
+            v_pad[i, :kvl] = v[ok:ok+kvl]; ok += kvl
+        q_pad = q_pad.permute(0, 2, 1, 3)
+        k_pad = k_pad.permute(0, 2, 1, 3)
+        v_pad = v_pad.permute(0, 2, 1, 3)
+        mask = torch.zeros(N, 1, max_q, max_kv, dtype=torch.bool, device=q.device)
+        for i in range(N):
+            mask[i, :, :q_seqlen[i], :kv_seqlen[i]] = True
+        o_pad = _sdpa(q_pad, k_pad, v_pad, attn_mask=mask)
+        o_pad = o_pad.permute(0, 2, 1, 3)
+        parts = [o_pad[i, :q_seqlen[i]] for i in range(N)]
+        out = torch.cat(parts, dim=0)
+    {needle}'''
+    return s.replace(needle, sdpa_branch)
+
+patched = patch_file(sparse_attn, patch_sparse_attn)
+print(f"Patched sparse attention sdpa backend: {patched}")
 PY
 
 WORKDIR /app
