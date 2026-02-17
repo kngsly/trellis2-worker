@@ -245,42 +245,42 @@ def patch_sparse_attn(s: str) -> str:
     if needle not in s:
         print("WARN: sparse attn raise ValueError not found; skipping sdpa attn patch")
         return s
-    sdpa_branch = f'''\
-    elif config.ATTN == 'sdpa':
-        {sparse_attn_marker}
-        from torch.nn.functional import scaled_dot_product_attention as _sdpa
-        if num_all_args == 1:
-            q, k, v = qkv.unbind(dim=1)
-        elif num_all_args == 2:
-            k, v = kv.unbind(dim=1)
-        N = len(q_seqlen)
-        H = q.shape[-2]
-        max_q = max(q_seqlen)
-        max_kv = max(kv_seqlen)
-        C_q = q.shape[-1]
-        C_k = k.shape[-1]
-        C_v = v.shape[-1]
-        q_pad = q.new_zeros(N, max_q, H, C_q)
-        k_pad = k.new_zeros(N, max_kv, H, C_k)
-        v_pad = v.new_zeros(N, max_kv, H, C_v)
-        oq = ok = 0
-        for i in range(N):
-            ql, kvl = q_seqlen[i], kv_seqlen[i]
-            q_pad[i, :ql] = q[oq:oq+ql]; oq += ql
-            k_pad[i, :kvl] = k[ok:ok+kvl]
-            v_pad[i, :kvl] = v[ok:ok+kvl]; ok += kvl
-        q_pad = q_pad.permute(0, 2, 1, 3)
-        k_pad = k_pad.permute(0, 2, 1, 3)
-        v_pad = v_pad.permute(0, 2, 1, 3)
-        mask = torch.zeros(N, 1, max_q, max_kv, dtype=torch.bool, device=q.device)
-        for i in range(N):
-            mask[i, :, :q_seqlen[i], :kv_seqlen[i]] = True
-        o_pad = _sdpa(q_pad, k_pad, v_pad, attn_mask=mask)
-        o_pad = o_pad.permute(0, 2, 1, 3)
-        parts = [o_pad[i, :q_seqlen[i]] for i in range(N)]
-        out = torch.cat(parts, dim=0)
-    {needle}'''
-    return s.replace(needle, sdpa_branch)
+    sdpa_code = (
+        "    elif config.ATTN == 'sdpa':\n"
+        "        " + sparse_attn_marker + "\n"
+        "        from torch.nn.functional import scaled_dot_product_attention as _sdpa\n"
+        "        if num_all_args == 1:\n"
+        "            q, k, v = qkv.unbind(dim=1)\n"
+        "        elif num_all_args == 2:\n"
+        "            k, v = kv.unbind(dim=1)\n"
+        "        N = len(q_seqlen)\n"
+        "        H = q.shape[-2]\n"
+        "        max_q = max(q_seqlen)\n"
+        "        max_kv = max(kv_seqlen)\n"
+        "        C_q = q.shape[-1]\n"
+        "        C_k = k.shape[-1]\n"
+        "        C_v = v.shape[-1]\n"
+        "        q_pad = q.new_zeros(N, max_q, H, C_q)\n"
+        "        k_pad = k.new_zeros(N, max_kv, H, C_k)\n"
+        "        v_pad = v.new_zeros(N, max_kv, H, C_v)\n"
+        "        oq = ok = 0\n"
+        "        for i in range(N):\n"
+        "            ql, kvl = q_seqlen[i], kv_seqlen[i]\n"
+        "            q_pad[i, :ql] = q[oq:oq+ql]; oq += ql\n"
+        "            k_pad[i, :kvl] = k[ok:ok+kvl]\n"
+        "            v_pad[i, :kvl] = v[ok:ok+kvl]; ok += kvl\n"
+        "        q_pad = q_pad.permute(0, 2, 1, 3)\n"
+        "        k_pad = k_pad.permute(0, 2, 1, 3)\n"
+        "        v_pad = v_pad.permute(0, 2, 1, 3)\n"
+        "        mask = torch.zeros(N, 1, max_q, max_kv, dtype=torch.bool, device=q.device)\n"
+        "        for i in range(N):\n"
+        "            mask[i, :, :q_seqlen[i], :kv_seqlen[i]] = True\n"
+        "        o_pad = _sdpa(q_pad, k_pad, v_pad, attn_mask=mask)\n"
+        "        o_pad = o_pad.permute(0, 2, 1, 3)\n"
+        "        parts = [o_pad[i, :q_seqlen[i]] for i in range(N)]\n"
+        "        out = torch.cat(parts, dim=0)\n"
+    )
+    return s.replace(needle, sdpa_code + needle)
 
 patched = patch_file(sparse_attn, patch_sparse_attn)
 print(f"Patched sparse attention sdpa backend: {patched}")
