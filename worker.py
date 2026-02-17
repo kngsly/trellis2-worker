@@ -1062,6 +1062,24 @@ def _get_pipeline(deadline: Optional[float] = None):
     # that only surfaces on the first user request (too late to retry).
     if dev == "cuda":
         import torch
+
+        # Diagnostic: log which cuBLAS library is actually loaded
+        try:
+            _log.info("cuBLAS diagnostics: checking loaded libraries")
+            with open("/proc/self/maps", "r") as f:
+                cublas_maps = [
+                    line.strip().split()[-1]
+                    for line in f
+                    if "cublas" in line.lower()
+                ]
+            seen = sorted(set(cublas_maps))
+            for path in seen:
+                _log.info("cuBLAS diagnostics: loaded lib: %s", path)
+            if not seen:
+                _log.info("cuBLAS diagnostics: no cuBLAS libraries in /proc/self/maps yet (lazy loading)")
+        except Exception as diag_err:
+            _log.warning("cuBLAS diagnostics failed: %s", diag_err)
+
         try:
             _log.info("cuBLAS warmup: running small matmul to verify cuBLAS initialization")
             a = torch.randn(4, 4, device="cuda")
@@ -1069,8 +1087,35 @@ def _get_pipeline(deadline: Optional[float] = None):
             del a, _
             torch.cuda.synchronize()
             _log.info("cuBLAS warmup: OK")
+
+            # Log cuBLAS after warmup (now loaded)
+            try:
+                with open("/proc/self/maps", "r") as f:
+                    cublas_maps = [
+                        line.strip().split()[-1]
+                        for line in f
+                        if "cublas" in line.lower()
+                    ]
+                seen = sorted(set(cublas_maps))
+                for path in seen:
+                    _log.info("cuBLAS warmup: loaded lib: %s", path)
+            except Exception:
+                pass
         except RuntimeError as e:
             _log.error("cuBLAS warmup FAILED: %s", e)
+            # Log which cuBLAS was loaded when it failed
+            try:
+                with open("/proc/self/maps", "r") as f:
+                    cublas_maps = [
+                        line.strip().split()[-1]
+                        for line in f
+                        if "cublas" in line.lower()
+                    ]
+                seen = sorted(set(cublas_maps))
+                for path in seen:
+                    _log.error("cuBLAS FAILED: loaded lib was: %s", path)
+            except Exception:
+                pass
             raise
 
     _PIPELINE = pipe
