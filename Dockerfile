@@ -224,11 +224,11 @@ sparse_cfg_marker = "# trellis2-worker build patch: add sdpa to sparse attn back
 def patch_sparse_cfg(s: str) -> str:
     if sparse_cfg_marker in s:
         return s
-    needle = "['xformers', 'flash_attn', 'flash_attn_3']"
+    needle = "env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3']:"
     if needle not in s:
         print("WARN: sparse config backend list not found; skipping sdpa config patch")
         return s
-    repl = f"['xformers', 'flash_attn', 'flash_attn_3', 'sdpa']  {sparse_cfg_marker}"
+    repl = f"env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3', 'sdpa']:  {sparse_cfg_marker}"
     return s.replace(needle, repl, 1)
 
 patched = patch_file(sparse_cfg, patch_sparse_cfg)
