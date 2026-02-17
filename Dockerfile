@@ -24,8 +24,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MAX_JOBS=${BUILD_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
     NINJAFLAGS=-j${BUILD_JOBS} \
-    # Prefer CUDA forward-compat runtime libs when host driver/runtime mismatch occurs.
-    LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+    # Library load order matters: container's CUDA toolkit libs (cuBLAS, cuDNN, etc.)
+    # must come before host driver libs mounted by NVIDIA container runtime.
+    # 1. /usr/local/cuda/compat - forward-compat shim (driver API)
+    # 2. /usr/local/cuda/lib64  - container's CUDA 13.0 libraries (cuBLAS, cuFFT, etc.)
+    # 3. /usr/local/nvidia/lib64 - host driver libs (libcuda.so, libnvidia-ml.so)
+    LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3.10 python3.10-venv python3.10-dev python3-pip \

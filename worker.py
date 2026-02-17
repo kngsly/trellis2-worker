@@ -1055,6 +1055,24 @@ def _get_pipeline(deadline: Optional[float] = None):
         pipe.cuda()
     else:
         pipe.to(dev)
+
+    # Warmup cuBLAS: force initialization by running a small matmul.
+    # Without this, cuBLAS is lazily initialized on the first F.linear call
+    # during /generate, and any library mismatch causes CUBLAS_STATUS_NOT_INITIALIZED
+    # that only surfaces on the first user request (too late to retry).
+    if dev == "cuda":
+        import torch
+        try:
+            _log.info("cuBLAS warmup: running small matmul to verify cuBLAS initialization")
+            a = torch.randn(4, 4, device="cuda")
+            _ = a @ a
+            del a, _
+            torch.cuda.synchronize()
+            _log.info("cuBLAS warmup: OK")
+        except RuntimeError as e:
+            _log.error("cuBLAS warmup FAILED: %s", e)
+            raise
+
     _PIPELINE = pipe
 
     with _READY_LOCK:
