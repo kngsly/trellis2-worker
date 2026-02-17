@@ -52,14 +52,11 @@ RUN python -m pip install --upgrade pip setuptools wheel
 RUN pip install torch==2.10.0 torchvision==0.25.0 --extra-index-url https://download.pytorch.org/whl/cu130
 
 # TRELLIS.2 sparse attention defaults to flash-attn; install it so /generate doesn't crash.
-# See: https://github.com/Dao-AILab/flash-attention#installation-and-features
-#
-# No prebuilt cu130/torch2.10 wheels exist on PyPI or flashattn.dev.
-# Flash-Attention 3 requires SM90+ (H100) so it won't work on RTX 4090 (SM89).
-# Build flash-attn 2 from source. This adds ~15-20 min to the Docker build but
-# is essential for acceptable inference speed (sdpa fallback is 2-3x slower).
-RUN pip install flash-attn --no-build-isolation 2>&1 | tail -20 \
-    || echo "WARNING: flash-attn source build failed, will use sdpa fallback (slower inference)"
+# No prebuilt cu130/torch2.10 wheels on PyPI or flashattn.dev.
+# Use community prebuilt wheel from mjun0812/flash-attention-prebuild-wheels.
+# See: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases
+RUN pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp310-cp310-linux_x86_64.whl \
+    || echo "WARNING: flash-attn wheel install failed, will use sdpa fallback (slower inference)"
 
 # Clone TRELLIS.2 source (used via PYTHONPATH; the repo does not ship as a pip package).
 WORKDIR /opt/trellis2
