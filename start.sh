@@ -31,4 +31,29 @@ if echo "$LD_LIBRARY_PATH" | grep -q "$COMPAT_DIR"; then
     fi
 fi
 
+# Force container's cuBLAS to load before any host-mounted version.
+# The NVIDIA container runtime mounts host compute libs at /usr/local/nvidia/lib64/
+# which can include a cuBLAS version that conflicts with what PyTorch was compiled against.
+# LD_PRELOAD ensures the container's CUDA 13.0 cuBLAS is loaded first.
+CUDA_LIB="/usr/local/cuda/lib64"
+_preload=""
+for lib in libcublas.so libcublasLt.so; do
+    if [ -f "${CUDA_LIB}/${lib}" ]; then
+        _preload="${_preload:+${_preload}:}${CUDA_LIB}/${lib}"
+    fi
+done
+if [ -n "$_preload" ]; then
+    export LD_PRELOAD="${_preload}${LD_PRELOAD:+:$LD_PRELOAD}"
+    echo "[start.sh] LD_PRELOAD set for container cuBLAS: ${_preload}"
+fi
+
+echo "[start.sh] Final LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+echo "[start.sh] Final LD_PRELOAD=${LD_PRELOAD:-<unset>}"
+
+# Log cuBLAS libraries from container vs host for diagnostics
+echo "[start.sh] cuBLAS in container (${CUDA_LIB}):"
+ls -la ${CUDA_LIB}/libcublas* 2>/dev/null || echo "  (none)"
+echo "[start.sh] cuBLAS in host-mounted (/usr/local/nvidia/lib64):"
+ls -la /usr/local/nvidia/lib64/libcublas* 2>/dev/null || echo "  (none)"
+
 exec python server.py
