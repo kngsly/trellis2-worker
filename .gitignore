@@ -7,3 +7,4 @@ __pycache__/
 .env
 *.log
 .DS_Store
+webstat_logs.txt

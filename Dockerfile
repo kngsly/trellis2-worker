@@ -1,4 +1,4 @@
-FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ARG TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9"
 ARG BUILD_JOBS="2"
@@ -8,9 +8,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    CUDA_MODULE_LOADING=LAZY \
     # Helps reduce fragmentation on long-running jobs.
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     OPENCV_IO_ENABLE_OPENEXR=1 \
@@ -23,13 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # Avoid OOM during extension builds (ninja/cmake/setuptools often respect these).
     MAX_JOBS=${BUILD_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
-    NINJAFLAGS=-j${BUILD_JOBS} \
-    # Library load order matters: container's CUDA toolkit libs (cuBLAS, cuDNN, etc.)
-    # must come before host driver libs mounted by NVIDIA container runtime.
-    # 1. /usr/local/cuda/compat - forward-compat shim (driver API)
-    # 2. /usr/local/cuda/lib64  - container's CUDA 13.0 libraries (cuBLAS, cuFFT, etc.)
-    # 3. /usr/local/nvidia/lib64 - host driver libs (libcuda.so, libnvidia-ml.so)
-    LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+    NINJAFLAGS=-j${BUILD_JOBS}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3.10 python3.10-venv python3.10-dev python3-pip \
@@ -37,7 +28,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ninja-build pkg-config \
       libgl1-mesa-glx libglib2.0-0 libsm6 libxrender1 libxext6 \
       libjpeg-dev \
-      cuda-compat-13-0 \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
@@ -46,17 +36,16 @@ RUN ln -sf /usr/bin/python3.10 /usr/bin/python && ln -sf /usr/bin/pip3 /usr/bin/
 # Keep build tooling current; some sdists (flash-attn) fail metadata generation on older pip/setuptools.
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# Torch first (CUDA 13.0)
-# Use --extra-index-url instead of --index-url to ensure cuda-bindings==13.0.3 can be found
-# See: https://github.com/pytorch/pytorch/issues/172926
-RUN pip install torch==2.10.0 torchvision==0.25.0 --extra-index-url https://download.pytorch.org/whl/cu130
+# Torch first (CUDA 12.4)
+RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
 # TRELLIS.2 sparse attention defaults to flash-attn; install it so /generate doesn't crash.
-# No prebuilt cu130/torch2.10 wheels on PyPI or flashattn.dev.
-# Use community prebuilt wheel from mjun0812/flash-attention-prebuild-wheels.
-# See: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases
-RUN pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp310-cp310-linux_x86_64.whl \
-    || echo "WARNING: flash-attn wheel install failed, will use sdpa fallback (slower inference)"
+# See: https://github.com/Dao-AILab/flash-attention#installation-and-features
+#
+# Prefer wheels when available (fast, reliable). If a wheel isn't available for the current
+# torch/cuda/python combo, fall back to building from source.
+RUN pip install --only-binary=:all: flash-attn==2.7.4.post1 \
+    || pip install flash-attn==2.7.4.post1 --no-build-isolation
 
 # Clone TRELLIS.2 source (used via PYTHONPATH; the repo does not ship as a pip package).
 WORKDIR /opt/trellis2
@@ -67,8 +56,8 @@ ENV PYTHONPATH=/opt/trellis2/src
 # - BiRefNet dtype/device mismatch (float vs half) during rembg preprocessing
 # - Robust alpha bbox cropping (avoid empty bbox when alpha is soft/empty)
 # - Guard against empty sparse coords (raise a clearer error instead of crashing deeper in sparse ops)
+# - Cap remesh resolution for low decimation targets (avoids OOM on 24GB GPUs)
 # - Postprocess cleanup after remesh (reduce floaters / disconnected components in exported meshes)
-# - Add 'sdpa' (PyTorch native) backend to sparse attention so flash_attn is optional
 RUN python - <<'PY'
 from __future__ import annotations
 
@@ -172,7 +161,7 @@ def patch_empty_coords_guard(s: str) -> str:
 patched = patch_file(p, patch_empty_coords_guard)
 print(f"Patched empty sparse coords guard: {patched}")
 
-# 4) O-Voxel postprocess: cap remesh resolution for low-poly to reduce CuMesh simplify VRAM (avoids OOM on 24GB)
+# 4) O-Voxel postprocess: cap remesh resolution for low decimation targets (avoids OOM on 24GB)
 ov = root / "o-voxel" / "o_voxel" / "postprocess.py"
 ov_res_marker = "# trellis2-worker build patch: cap remesh resolution for low decimation"
 def patch_ovoxel_remesh_res(s: str) -> str:
@@ -193,7 +182,7 @@ def patch_ovoxel_remesh_res(s: str) -> str:
 patched = patch_file(ov, patch_ovoxel_remesh_res)
 print(f"Patched o_voxel remesh resolution cap: {patched}")
 
-# 5) O-Voxel postprocess: cleanup after remesh (the standard branch already does this)
+# 5) O-Voxel postprocess: cleanup after remesh
 ov_cleanup_marker = "# trellis2-worker build patch: cleanup after remesh"
 def patch_ovoxel_cleanup(s: str) -> str:
     if ov_cleanup_marker in s:
@@ -216,73 +205,6 @@ def patch_ovoxel_cleanup(s: str) -> str:
 
 patched = patch_file(ov, patch_ovoxel_cleanup)
 print(f"Patched o_voxel remesh cleanup: {patched}")
-
-# 6) Add 'sdpa' to sparse attention config valid backends
-sparse_cfg = root / "trellis2" / "modules" / "sparse" / "config.py"
-sparse_cfg_marker = "# trellis2-worker build patch: add sdpa to sparse attn backends"
-def patch_sparse_cfg(s: str) -> str:
-    if sparse_cfg_marker in s:
-        return s
-    needle = "env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3']:"
-    if needle not in s:
-        print("WARN: sparse config backend list not found; skipping sdpa config patch")
-        return s
-    repl = f"env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3', 'sdpa']:  {sparse_cfg_marker}"
-    return s.replace(needle, repl, 1)
-
-patched = patch_file(sparse_cfg, patch_sparse_cfg)
-print(f"Patched sparse config sdpa backend: {patched}")
-
-# 7) Add 'sdpa' branch to sparse attention full_attn.py
-sparse_attn = root / "trellis2" / "modules" / "sparse" / "attention" / "full_attn.py"
-sparse_attn_marker = "# trellis2-worker build patch: sdpa backend for sparse attention"
-def patch_sparse_attn(s: str) -> str:
-    if sparse_attn_marker in s:
-        return s
-    # Insert sdpa branch before the else/raise ValueError
-    needle = "    else:\n        raise ValueError(f\"Unknown attention module: {config.ATTN}\")"
-    if needle not in s:
-        print("WARN: sparse attn raise ValueError not found; skipping sdpa attn patch")
-        return s
-    sdpa_code = (
-        "    elif config.ATTN == 'sdpa':\n"
-        "        " + sparse_attn_marker + "\n"
-        "        from torch.nn.functional import scaled_dot_product_attention as _sdpa\n"
-        "        if num_all_args == 1:\n"
-        "            q, k, v = qkv.unbind(dim=1)\n"
-        "        elif num_all_args == 2:\n"
-        "            k, v = kv.unbind(dim=1)\n"
-        "        N = len(q_seqlen)\n"
-        "        H = q.shape[-2]\n"
-        "        max_q = max(q_seqlen)\n"
-        "        max_kv = max(kv_seqlen)\n"
-        "        C_q = q.shape[-1]\n"
-        "        C_k = k.shape[-1]\n"
-        "        C_v = v.shape[-1]\n"
-        "        q_pad = q.new_zeros(N, max_q, H, C_q)\n"
-        "        k_pad = k.new_zeros(N, max_kv, H, C_k)\n"
-        "        v_pad = v.new_zeros(N, max_kv, H, C_v)\n"
-        "        oq = ok = 0\n"
-        "        for i in range(N):\n"
-        "            ql, kvl = q_seqlen[i], kv_seqlen[i]\n"
-        "            q_pad[i, :ql] = q[oq:oq+ql]; oq += ql\n"
-        "            k_pad[i, :kvl] = k[ok:ok+kvl]\n"
-        "            v_pad[i, :kvl] = v[ok:ok+kvl]; ok += kvl\n"
-        "        q_pad = q_pad.permute(0, 2, 1, 3)\n"
-        "        k_pad = k_pad.permute(0, 2, 1, 3)\n"
-        "        v_pad = v_pad.permute(0, 2, 1, 3)\n"
-        "        mask = torch.zeros(N, 1, max_q, max_kv, dtype=torch.bool, device=q.device)\n"
-        "        for i in range(N):\n"
-        "            mask[i, :, :q_seqlen[i], :kv_seqlen[i]] = True\n"
-        "        o_pad = _sdpa(q_pad, k_pad, v_pad, attn_mask=mask)\n"
-        "        o_pad = o_pad.permute(0, 2, 1, 3)\n"
-        "        parts = [o_pad[i, :q_seqlen[i]] for i in range(N)]\n"
-        "        out = torch.cat(parts, dim=0)\n"
-    )
-    return s.replace(needle, sdpa_code + needle)
-
-patched = patch_file(sparse_attn, patch_sparse_attn)
-print(f"Patched sparse attention sdpa backend: {patched}")
 PY
 
 WORKDIR /app
@@ -349,11 +271,9 @@ RUN mkdir -p /tmp/extensions \
 
 COPY server.py /app/server.py
 COPY worker.py /app/worker.py
-COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
 
 RUN mkdir -p /outputs
 ENV OUTPUT_DIR=/outputs
 
 EXPOSE 8000
-CMD ["/app/start.sh"]
+CMD ["python", "server.py"]
