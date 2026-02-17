@@ -783,6 +783,65 @@ def _disable_cuda_compat_if_unneeded() -> None:
         )
 
 
+def _is_cublas_error(exc: BaseException) -> bool:
+    """Detect cuBLAS initialization or runtime failures (e.g. CUBLAS_STATUS_NOT_INITIALIZED)."""
+    s = (str(exc) or "").lower()
+    markers = (
+        "cublas_status_not_initialized",
+        "cublas_status_internal_error",
+        "cublas_status_alloc_failed",
+        "cublas error",
+        "cublas_status_execution_failed",
+        "cublasltmatmul",  # cuBLAS LT matmul failures
+    )
+    return any(m in s for m in markers)
+
+
+def _is_cuda_context_error(exc: BaseException) -> bool:
+    """Detect CUDA context failures that may be recoverable with a context reset."""
+    s = (str(exc) or "").lower()
+    markers = (
+        "cublas_status_not_initialized",
+        "cuda error: invalid resource handle",
+        "cuda error: device-side assert",
+        "cuda error: an illegal memory access",
+        "cuda error: unspecified launch failure",
+        "cuda context",
+        "cuda error: misaligned address",
+    )
+    return any(m in s for m in markers)
+
+
+def _cuda_recover_context() -> bool:
+    """
+    Attempt to recover from a CUDA context error by synchronizing, clearing caches,
+    and running a small validation matmul.
+    Returns True if recovery succeeded.
+    """
+    try:
+        import torch
+        # Synchronize to flush any pending errors
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        # Clear all caches
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        # Validate with a small matmul (forces cuBLAS re-init)
+        a = torch.randn(2, 2, device="cuda")
+        b = torch.randn(2, 2, device="cuda")
+        _ = torch.mm(a, b)
+        torch.cuda.synchronize()
+        del a, b
+        torch.cuda.empty_cache()
+        return True
+    except Exception as e:
+        print(f"[worker] cuda-recover: recovery failed: {e}", flush=True)
+        return False
+
+
 def _is_probably_driver_runtime_error(exc: BaseException) -> bool:
     s = str(exc or "").lower()
     if not s:
@@ -801,6 +860,37 @@ def _is_probably_driver_runtime_error(exc: BaseException) -> bool:
         "driver/library version mismatch",
     )
     return any(m in s for m in markers)
+
+
+def _cuda_warmup() -> bool:
+    """
+    Force-initialize cuBLAS and validate CUDA context by running a small matmul.
+
+    PyTorch initializes cuBLAS lazily on the first matmul. If the CUDA driver state
+    is subtly broken (e.g. compat library mismatch, driver reset), the first real
+    matmul inside the model (DINOv3 attention q_proj) will crash with
+    CUBLAS_STATUS_NOT_INITIALIZED. Doing it here surfaces the failure early.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        # Small matmul forces cuBLAS handle creation
+        a = torch.randn(4, 4, device="cuda")
+        b = torch.randn(4, 4, device="cuda")
+        c = torch.mm(a, b)
+        torch.cuda.synchronize()
+        # Also validate cuBLAS via linear layer (closer to what DINOv3 does)
+        lin = torch.nn.Linear(4, 4, device="cuda")
+        _ = lin(a)
+        torch.cuda.synchronize()
+        del a, b, c, lin
+        torch.cuda.empty_cache()
+        print("[worker] cuda-warmup: cuBLAS initialized successfully", flush=True)
+        return True
+    except Exception as e:
+        print(f"[worker] cuda-warmup: FAILED - {e}", flush=True)
+        return False
 
 
 def _lazy_import_pipeline():
@@ -1155,6 +1245,23 @@ def _preload_heartbeat(interval_sec: float, started_at: float) -> None:
 
 def _preload_worker():
     global _PIPELINE
+    try:
+        _preload_worker_inner()
+    except Exception as e:
+        # Catch-all: ensure /ready always reports error if the preload thread dies.
+        # Without this, an unhandled exception in the daemon thread would leave
+        # _READY["status"] stuck on "loading_weights" forever.
+        tb = traceback.format_exc()
+        with _READY_LOCK:
+            if _READY.get("status") not in ("ready", "error"):
+                _READY["status"] = "error"
+                _READY["detail"] = f"preload thread crashed: {tb[-3000:]}" if tb else f"preload thread crashed: {e!r}"
+        _log.error("preload: UNHANDLED EXCEPTION: %s", e, exc_info=True)
+        print(f"[worker] preload: UNHANDLED EXCEPTION\n{tb or e!r}", flush=True)
+
+
+def _preload_worker_inner():
+    global _PIPELINE
     # CUDA check runs in background after server is up; no process exit, just error state if unavailable.
     # With the fast-fail mechanism in _wait_for_cuda, driver incompatibility is detected in ~10-15s.
     # The grace_sec is the *maximum* wait; actual failure may be much faster.
@@ -1176,6 +1283,16 @@ def _preload_worker():
         _log.error("preload: aborting (CUDA unavailable); server remains up for /health and /ready")
         return
 
+    # Eagerly initialize cuBLAS to surface driver issues before model loading.
+    # Without this, a broken CUDA context only manifests during the first matmul
+    # inside the model (e.g. DINOv3 attention q_proj -> CUBLAS_STATUS_NOT_INITIALIZED).
+    if _get_device().lower() == "cuda":
+        with _READY_LOCK:
+            _READY["detail"] = "warming up CUDA (cuBLAS init)"
+        if not _cuda_warmup():
+            _log.warning("preload: cuBLAS warmup failed; model load may still succeed")
+            print("[worker] preload: cuBLAS warmup failed (will attempt model load anyway)", flush=True)
+
     preload_retries = max(1, _int_env("TRELLIS2_PRELOAD_RETRIES", 3))
     retry_base_sec = max(1, _int_env("TRELLIS2_PRELOAD_RETRY_BASE_SEC", 15))
     heartbeat_interval_sec = max(30, _int_env("TRELLIS2_PRELOAD_HEARTBEAT_SEC", 90))
@@ -1191,7 +1308,12 @@ def _preload_worker():
                 f" HF_HUB_DOWNLOAD_TIMEOUT={os.environ.get('HF_HUB_DOWNLOAD_TIMEOUT')}"
                 f" HF_HUB_ETAG_TIMEOUT={os.environ.get('HF_HUB_ETAG_TIMEOUT')}"
             )
-            raise RuntimeError(_msg)
+            with _READY_LOCK:
+                _READY["status"] = "error"
+                _READY["detail"] = _msg
+            _log.error("preload: %s", _msg)
+            print(f"[worker] preload: {_msg}", flush=True)
+            return
         try:
             if attempt > 1:
                 _PIPELINE = None
@@ -1237,6 +1359,10 @@ def _preload_worker():
                 )
                 if _is_cuda_oom(e):
                     _cuda_empty_cache()
+                # On CUBLAS/context errors, attempt CUDA recovery before retrying
+                if _is_cublas_error(e) or _is_cuda_context_error(e):
+                    print("[worker] preload: attempting CUDA context recovery before retry", flush=True)
+                    _cuda_recover_context()
                 time.sleep(sleep_sec)
                 continue
             tb = traceback.format_exc()
@@ -1739,6 +1865,7 @@ def generate_glb_from_image_bytes_list(
         max_attempts = max(1, retries)
         img0 = primary_img
         oom_run_retried = False
+        cublas_run_retried = False
         oom_quality_level = 0  # Track quality degradation level for OOM fallbacks
         original_kwargs = dict(kwargs)  # Save original settings for OOM fallback
         original_img_size = img0.size  # Save original image size
@@ -1940,6 +2067,24 @@ def generate_glb_from_image_bytes_list(
                     else:
                         print("[worker] pipe.run OOM after all 13 quality degradation attempts", flush=True)
                         raise RuntimeError("Worker ran out of memory, model was too complex.") from e
+
+                # One-time retry on CUBLAS/CUDA context errors (e.g. CUBLAS_STATUS_NOT_INITIALIZED
+                # in DINOv3 attention, GPU reset, or driver transient). Attempt context recovery
+                # instead of immediately destroying the instance.
+                if (_is_cublas_error(e) or _is_cuda_context_error(e)) and not cublas_run_retried:
+                    cublas_run_retried = True
+                    print(
+                        f"[worker] pipe.run CUDA context error: {str(e)[:200]}; "
+                        f"attempting recovery and retry",
+                        flush=True,
+                    )
+                    recovered = _cuda_recover_context()
+                    if recovered:
+                        print("[worker] CUDA context recovered, retrying pipe.run", flush=True)
+                        continue
+                    else:
+                        print("[worker] CUDA context recovery failed, raising error", flush=True)
+                        raise
 
                 # Handle non-OOM errors
                 if not _is_empty_sparse_error(e):
