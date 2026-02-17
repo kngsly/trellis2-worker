@@ -56,4 +56,18 @@ ls -la ${CUDA_LIB}/libcublas* 2>/dev/null || echo "  (none)"
 echo "[start.sh] cuBLAS in host-mounted (/usr/local/nvidia/lib64):"
 ls -la /usr/local/nvidia/lib64/libcublas* 2>/dev/null || echo "  (none)"
 
+# Auto-detect attention backend: prefer flash_attn if installed, fall back to sdpa (PyTorch native).
+if [ -z "${ATTN_BACKEND:-}" ]; then
+    if python -c "import flash_attn" 2>/dev/null; then
+        export ATTN_BACKEND="flash_attn"
+        echo "[start.sh] ATTN_BACKEND=flash_attn (flash_attn installed)"
+    else
+        export ATTN_BACKEND="sdpa"
+        export SPARSE_ATTN_BACKEND="sdpa"
+        echo "[start.sh] ATTN_BACKEND=sdpa (flash_attn not available, using PyTorch native)"
+    fi
+else
+    echo "[start.sh] ATTN_BACKEND=${ATTN_BACKEND} (explicit override)"
+fi
+
 exec python server.py
