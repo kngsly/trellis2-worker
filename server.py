@@ -132,6 +132,7 @@ async def generate(
     preprocess_image: Optional[str] = Form(None),
     post_scale_z: Optional[str] = Form(None),
     backup_inputs: Optional[str] = Form(None),
+    decimation_target: Optional[str] = Form(None),
 ):
     export_meta: dict = {}
     try:
@@ -145,6 +146,14 @@ async def generate(
                 safe_seed = int(str(seed).strip())
             except Exception:
                 safe_seed = None
+        safe_decimation_target = None
+        if decimation_target is not None and str(decimation_target).strip():
+            try:
+                v = int(str(decimation_target).strip())
+                if v > 0:
+                    safe_decimation_target = v
+            except Exception:
+                safe_decimation_target = None
 
         uploads: List[UploadFile] = []
         if images:
@@ -178,6 +187,7 @@ async def generate(
                 post_scale_z=want_post_scale_z,
                 backup_inputs=want_backup,
                 export_meta=export_meta,
+                decimation_target=safe_decimation_target,
             )
         )
         resp = {"success": True, "glb_path": str(out_path)}

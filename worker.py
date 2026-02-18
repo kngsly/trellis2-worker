@@ -734,16 +734,12 @@ def _resolve_pipeline_type(requested: Optional[str]) -> str:
     return os.environ.get("TRELLIS2_PIPELINE_TYPE", "1024_cascade").strip() or "1024_cascade"
 
 
-def _choose_export_params(low_poly: bool):
+def _choose_export_params(low_poly: bool, decimation_target: Optional[int] = None):
     if low_poly:
-        return (
-            _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 75000),
-            _int_env("TRELLIS2_TEXTURE_SIZE_LOW_POLY", 2048),
-        )
-    return (
-        _int_env("TRELLIS2_DECIMATION_TARGET", 1000000),
-        _int_env("TRELLIS2_TEXTURE_SIZE", 4096),
-    )
+        dec = decimation_target if decimation_target and decimation_target > 0 else _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 75000)
+        return (dec, _int_env("TRELLIS2_TEXTURE_SIZE_LOW_POLY", 2048))
+    dec = decimation_target if decimation_target and decimation_target > 0 else _int_env("TRELLIS2_DECIMATION_TARGET", 1000000)
+    return (dec, _int_env("TRELLIS2_TEXTURE_SIZE", 4096))
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +756,7 @@ def generate_glb_from_image_bytes_list(
     post_scale_z: Optional[float] = None,
     backup_inputs: bool = True,
     export_meta: Optional[dict] = None,
+    decimation_target: Optional[int] = None,
 ) -> Path:
     if not images_bytes:
         raise ValueError("empty upload")
@@ -1074,7 +1071,7 @@ def generate_glb_from_image_bytes_list(
 
         # Export to GLB via o-voxel postprocess util.
         _cuda_empty_cache()
-        decimation_target, texture_size = _choose_export_params(low_poly)
+        decimation_target, texture_size = _choose_export_params(low_poly, decimation_target=decimation_target)
         decimation_initial = int(decimation_target)
         uid = uuid.uuid4().hex
         dec_min = _int_env("TRELLIS2_DECIMATION_MIN_OOM_FALLBACK", 15000)
