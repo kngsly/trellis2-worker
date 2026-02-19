@@ -74,6 +74,26 @@ Notes:
   - `TRELLIS2_UPSCALE_SMALL=1` (default) and `TRELLIS2_UPSCALE_TARGET=512`
   - `TRELLIS2_FORCE_RGB=1` (optional, composites alpha onto white)
 
+### Troubleshooting: Box Artifacts / Flat 2D Results
+
+If outputs show a square box around the object or collapse into a textured 2D slab:
+
+- Keep `preprocess_image=true` (default) so the worker can sanitize masks and retry bad mattes.
+- Prefer clean transparent PNGs where background alpha is truly zero.
+- Check `worker_export` in the `/generate` response:
+  - `oom_quality_degradation_level`: high values can reduce geometric quality.
+  - `mesh_thin_axis_ratio`: near-zero values indicate a planar/flat collapse.
+- If you have access to gated upstream models, use the original conditioning stack:
+  - `TRELLIS2_AVOID_GATED_DEPS=0`
+  - `TRELLIS2_AVOID_GATED_REMBG_DEPS=0`
+
+Advanced mask controls:
+
+- `TRELLIS2_PREPROCESS_REMBG_ON_BAD_ALPHA=1` (default): if alpha appears unreliable, retry segmentation with rembg.
+- `TRELLIS2_PREPROCESS_MIN_MASK_AREA_FRAC=0.00005`: ignore tiny alpha noise while finding bbox.
+- `TRELLIS2_PREPROCESS_ALLOW_ALPHA_NONZERO_FALLBACK=0` (default): avoids full-frame bbox from faint nonzero alpha haze.
+- `TRELLIS2_MIN_THIN_AXIS_RATIO=0.001`: reject near-planar meshes and retry with a new seed.
+
 ## Export Image From VM (download locally, then push from your machine)
 
 On the VM:

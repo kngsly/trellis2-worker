@@ -527,7 +527,8 @@ def _prepare_input_image(im: Image.Image) -> Image.Image:
 def _safe_alpha_bbox(alpha: np.ndarray, primary_thresh: float = 0.8) -> Optional[tuple[int, int, int, int]]:
     """
     Return bbox (x0,y0,x1,y1) inclusive for alpha mask.
-    Tries a high threshold first (matching upstream), then falls back to any non-zero alpha.
+    Uses robust thresholding + largest connected component to avoid tiny noisy halos
+    around the frame from dominating the crop.
     """
     if alpha.ndim != 2:
         return None
@@ -535,20 +536,78 @@ def _safe_alpha_bbox(alpha: np.ndarray, primary_thresh: float = 0.8) -> Optional
     if h <= 0 or w <= 0:
         return None
 
-    def _bbox_for_thresh(t: float) -> Optional[tuple[int, int, int, int]]:
-        coords = np.argwhere(alpha > (t * 255.0))
-        if coords.size == 0:
-            return None
-        y0 = int(coords[:, 0].min())
-        y1 = int(coords[:, 0].max())
-        x0 = int(coords[:, 1].min())
-        x1 = int(coords[:, 1].max())
-        return (x0, y0, x1, y1)
+    positive = alpha[alpha > 0]
+    if positive.size == 0:
+        return None
 
-    bb = _bbox_for_thresh(float(primary_thresh))
-    if bb is None:
-        bb = _bbox_for_thresh(0.0)
-    return bb
+    min_area_frac = max(0.0, _float_env("TRELLIS2_PREPROCESS_MIN_MASK_AREA_FRAC", 0.00005))
+    min_area_px = max(16, int(round(float(h * w) * min_area_frac)))
+
+    def _largest_component_bbox(mask: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+        if mask.ndim != 2:
+            return None
+        mask = (mask > 0).astype(np.uint8)
+        if int(mask.sum()) < min_area_px:
+            return None
+
+        try:
+            import cv2  # type: ignore
+
+            n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            if n_labels <= 1:
+                return None
+            # Skip label 0 (background), pick the largest foreground component.
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            if areas.size == 0:
+                return None
+            best = int(np.argmax(areas)) + 1
+            area = int(stats[best, cv2.CC_STAT_AREA])
+            if area < min_area_px:
+                return None
+            x0 = int(stats[best, cv2.CC_STAT_LEFT])
+            y0 = int(stats[best, cv2.CC_STAT_TOP])
+            ww = int(stats[best, cv2.CC_STAT_WIDTH])
+            hh = int(stats[best, cv2.CC_STAT_HEIGHT])
+            x1 = x0 + max(0, ww - 1)
+            y1 = y0 + max(0, hh - 1)
+            return (x0, y0, x1, y1)
+        except Exception:
+            # Fallback when cv2 isn't available: bbox of all non-zero pixels.
+            coords = np.argwhere(mask > 0)
+            if coords.size == 0:
+                return None
+            y0 = int(coords[:, 0].min())
+            y1 = int(coords[:, 0].max())
+            x0 = int(coords[:, 1].min())
+            x1 = int(coords[:, 1].max())
+            return (x0, y0, x1, y1)
+
+    thr_primary = float(np.clip(primary_thresh, 0.0, 1.0))
+    maxv = float(positive.max()) / 255.0
+    thresholds: List[float] = [thr_primary, 0.6, 0.4, 0.25, 0.12]
+    thresholds.extend([max(0.005, 0.6 * maxv), max(0.005, 0.3 * maxv)])
+    try:
+        q95 = float(np.quantile(positive, 0.95)) / 255.0
+        q85 = float(np.quantile(positive, 0.85)) / 255.0
+        q70 = float(np.quantile(positive, 0.70)) / 255.0
+        thresholds.extend([q95, q85, q70])
+    except Exception:
+        pass
+
+    tried = set()
+    for t in sorted((float(np.clip(v, 0.0, 1.0)) for v in thresholds), reverse=True):
+        # Deduplicate thresholds after clipping/rounding.
+        k = int(round(t * 1000))
+        if k in tried:
+            continue
+        tried.add(k)
+        bb = _largest_component_bbox(alpha > (t * 255.0))
+        if bb is not None:
+            return bb
+
+    if _bool_env("TRELLIS2_PREPROCESS_ALLOW_ALPHA_NONZERO_FALLBACK", False):
+        return _largest_component_bbox(alpha > 0)
+    return None
 
 
 def _crop_square_around_bbox(
@@ -590,6 +649,62 @@ def _is_rembg_dtype_mismatch(exc: BaseException) -> bool:
     return False
 
 
+def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
+    """
+    Execute rembg model with low-vram guardrails and dtype-mismatch fallback.
+    Returns RGBA output.
+    """
+    low_vram = bool(getattr(pipe, "low_vram", False))
+    rembg_model = getattr(pipe, "rembg_model", None)
+    if rembg_model is None:
+        return im_rgb.convert("RGBA")
+
+    if low_vram:
+        try:
+            rembg_model.to(pipe.device)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    try:
+        out_rgba = rembg_model(im_rgb)  # type: ignore[attr-defined]
+    except Exception as e:
+        if _is_rembg_dtype_mismatch(e):
+            print(
+                "[worker] rembg: dtype mismatch during preprocess; retrying with rembg model forced to float32",
+                flush=True,
+            )
+            try:
+                rembg_model.float()  # type: ignore[attr-defined]
+                if low_vram:
+                    rembg_model.to(pipe.device)  # type: ignore[attr-defined]
+                out_rgba = rembg_model(im_rgb)  # type: ignore[attr-defined]
+            except Exception as e2:
+                if _bool_env("TRELLIS2_PREPROCESS_DISABLE_REMBG_ON_ERROR", True):
+                    print(
+                        f"[worker] rembg: retry failed ({e2}); continuing without rembg preprocessing",
+                        flush=True,
+                    )
+                    out_rgba = im_rgb.convert("RGBA")
+                else:
+                    raise
+        elif _bool_env("TRELLIS2_PREPROCESS_DISABLE_REMBG_ON_ERROR", True):
+            print(
+                f"[worker] rembg: preprocess failed ({e}); continuing without rembg preprocessing",
+                flush=True,
+            )
+            out_rgba = im_rgb.convert("RGBA")
+        else:
+            raise
+    finally:
+        if low_vram:
+            try:
+                rembg_model.cpu()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    return out_rgba
+
+
 def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
     """
     Preprocess to match the official demo behavior, but with guardrails:
@@ -618,55 +733,32 @@ def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
 
     if not has_alpha:
         im_rgb = input_im.convert("RGB")
-        low_vram = bool(getattr(pipe, "low_vram", False))
-        rembg_model = getattr(pipe, "rembg_model", None)
-        if rembg_model is None:
-            out_rgba = im_rgb.convert("RGBA")
-        else:
-            if low_vram:
-                try:
-                    rembg_model.to(pipe.device)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-
-            try:
-                out_rgba = rembg_model(im_rgb)  # type: ignore[attr-defined]
-            except Exception as e:
-                if _is_rembg_dtype_mismatch(e):
-                    print(
-                        "[worker] rembg: dtype mismatch during preprocess; retrying with rembg model forced to float32",
-                        flush=True,
-                    )
-                    try:
-                        rembg_model.float()  # type: ignore[attr-defined]
-                        if low_vram:
-                            rembg_model.to(pipe.device)  # type: ignore[attr-defined]
-                        out_rgba = rembg_model(im_rgb)  # type: ignore[attr-defined]
-                    except Exception as e2:
-                        if _bool_env("TRELLIS2_PREPROCESS_DISABLE_REMBG_ON_ERROR", True):
-                            print(
-                                f"[worker] rembg: retry failed ({e2}); continuing without rembg preprocessing",
-                                flush=True,
-                            )
-                            out_rgba = im_rgb.convert("RGBA")
-                        else:
-                            raise
-                elif _bool_env("TRELLIS2_PREPROCESS_DISABLE_REMBG_ON_ERROR", True):
-                    print(
-                        f"[worker] rembg: preprocess failed ({e}); continuing without rembg preprocessing",
-                        flush=True,
-                    )
-                    out_rgba = im_rgb.convert("RGBA")
-                else:
-                    raise
-            finally:
-                if low_vram:
-                    try:
-                        rembg_model.cpu()  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+        out_rgba = _run_rembg_rgba(pipe, im_rgb)
     else:
         out_rgba = input_im.convert("RGBA")
+        # Guardrail: broken/near-empty alpha mattes can cause full-frame box crops.
+        # If alpha looks unusable, optionally re-run rembg on RGB.
+        if _bool_env("TRELLIS2_PREPROCESS_REMBG_ON_BAD_ALPHA", True):
+            alpha_probe = np.array(out_rgba)[:, :, 3]
+            probe_thresh = _float_env("TRELLIS2_PREPROCESS_ALPHA_BBOX_THRESHOLD", 0.8)
+            bb_probe = _safe_alpha_bbox(alpha_probe, primary_thresh=probe_thresh)
+            bad_alpha = bb_probe is None
+            if not bad_alpha:
+                w_probe, h_probe = out_rgba.size
+                x0, y0, x1, y1 = bb_probe
+                bb_area = max(1, (int(x1) - int(x0) + 1) * (int(y1) - int(y0) + 1))
+                cover = float(bb_area) / float(max(1, w_probe * h_probe))
+                strong_cover = float((alpha_probe > int(0.8 * 255.0)).mean())
+                max_cover = _float_env("TRELLIS2_PREPROCESS_BAD_ALPHA_MAX_BBOX_COVER", 0.98)
+                min_strong = _float_env("TRELLIS2_PREPROCESS_BAD_ALPHA_MIN_STRONG_COVER", 0.70)
+                if cover >= max_cover and strong_cover < min_strong:
+                    bad_alpha = True
+            if bad_alpha:
+                print(
+                    "[worker] preprocess: alpha matte looks unreliable; retrying with rembg segmentation",
+                    flush=True,
+                )
+                out_rgba = _run_rembg_rgba(pipe, input_im.convert("RGB"))
 
     out_np = np.array(out_rgba)
     if out_np.ndim != 3 or out_np.shape[2] < 4:
@@ -845,7 +937,38 @@ def generate_glb_from_image_bytes_list(
             msg = (str(exc) or "").lower()
             return ("input.numel() == 0" in msg) or ("max(): expected reduction dim" in msg) or ("empty sparse coords" in msg)
 
-        retries = _int_env("TRELLIS2_EMPTY_SPARSE_RETRIES", 4)
+        def _is_retryable_generation_error(exc: BaseException) -> bool:
+            msg = (str(exc) or "").lower()
+            if _is_empty_sparse_error(exc):
+                return True
+            if "pipeline produced empty mesh" in msg:
+                return True
+            if "pipeline produced planar mesh" in msg:
+                return True
+            return False
+
+        def _mesh_axis_ratio(mesh_obj) -> Optional[tuple[float, float, float]]:
+            try:
+                verts = getattr(mesh_obj, "vertices", None)
+                if verts is None:
+                    return None
+                if hasattr(verts, "detach"):
+                    v = verts.detach().float().cpu().numpy()
+                else:
+                    v = np.asarray(verts)
+                if v.ndim != 2 or v.shape[0] < 3 or v.shape[1] < 3:
+                    return None
+                xyz = v[:, :3].astype(np.float32, copy=False)
+                ext = np.max(xyz, axis=0) - np.min(xyz, axis=0)
+                min_extent = float(np.min(ext))
+                max_extent = float(np.max(ext))
+                if max_extent <= 1e-9:
+                    return (min_extent, max_extent, 0.0)
+                return (min_extent, max_extent, min_extent / max_extent)
+            except Exception:
+                return None
+
+        retries = _int_env("TRELLIS2_GENERATION_RETRIES", _int_env("TRELLIS2_EMPTY_SPARSE_RETRIES", 4))
         last_err: Optional[BaseException] = None
         input_fallback_attempted = False
 
@@ -857,6 +980,7 @@ def generate_glb_from_image_bytes_list(
         img0 = primary_img
         oom_quality_level = 0
         original_kwargs = dict(kwargs)
+        mesh_axis_stats: Optional[tuple[float, float, float]] = None
 
         while True:
             try:
@@ -871,15 +995,27 @@ def generate_glb_from_image_bytes_list(
                 # Validate mesh output
                 if not hasattr(mesh, "vertices") or not hasattr(mesh, "faces"):
                     raise RuntimeError("pipeline output missing vertices or faces attributes")
-                try:
-                    vert_count = len(mesh.vertices) if hasattr(mesh.vertices, "__len__") else 0
-                    face_count = len(mesh.faces) if hasattr(mesh.faces, "__len__") else 0
-                    if vert_count == 0 or face_count == 0:
-                        raise RuntimeError(f"pipeline produced empty mesh: {vert_count} verts, {face_count} faces")
-                    if face_count > vert_count * 10:
-                        print(f"[worker] WARNING: unusual mesh topology: {vert_count} verts, {face_count} faces (ratio {face_count/vert_count:.1f})", flush=True)
-                except Exception as e:
-                    print(f"[worker] WARNING: mesh validation check failed: {e}", flush=True)
+                vert_count = len(mesh.vertices) if hasattr(mesh.vertices, "__len__") else 0
+                face_count = len(mesh.faces) if hasattr(mesh.faces, "__len__") else 0
+                if vert_count == 0 or face_count == 0:
+                    raise RuntimeError(f"pipeline produced empty mesh: {vert_count} verts, {face_count} faces")
+                if face_count > vert_count * 10:
+                    print(
+                        f"[worker] WARNING: unusual mesh topology: {vert_count} verts, {face_count} faces "
+                        f"(ratio {face_count/vert_count:.1f})",
+                        flush=True,
+                    )
+                min_thin_axis_ratio = max(0.0, _float_env("TRELLIS2_MIN_THIN_AXIS_RATIO", 0.001))
+                if min_thin_axis_ratio > 0.0:
+                    mesh_axis_stats = _mesh_axis_ratio(mesh)
+                    if mesh_axis_stats is not None:
+                        min_extent, max_extent, thin_axis_ratio = mesh_axis_stats
+                        if thin_axis_ratio < min_thin_axis_ratio:
+                            raise RuntimeError(
+                                "pipeline produced planar mesh: "
+                                f"thin_axis_ratio={thin_axis_ratio:.6f}, "
+                                f"min_extent={min_extent:.6f}, max_extent={max_extent:.6f}"
+                            )
 
                 if oom_quality_level > 0:
                     degradation_desc = []
@@ -1041,11 +1177,11 @@ def generate_glb_from_image_bytes_list(
                             img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
                             print(f"[worker] pipe.run OOM (level 12), downscaled to absolute minimum {w}x{h}->{new_w}x{new_h}", flush=True)
                         if "sparse_structure_sampler_params" in kwargs:
-                            kwargs["sparse_structure_sampler_params"]["steps"] = 2
+                            kwargs["sparse_structure_sampler_params"]["steps"] = 4
                         if "shape_slat_sampler_params" in kwargs:
-                            kwargs["shape_slat_sampler_params"]["steps"] = 2
+                            kwargs["shape_slat_sampler_params"]["steps"] = 4
                         if "tex_slat_sampler_params" in kwargs:
-                            kwargs["tex_slat_sampler_params"]["steps"] = 2
+                            kwargs["tex_slat_sampler_params"]["steps"] = 4
                         continue
 
                     # Level 13+: All fallbacks exhausted
@@ -1053,8 +1189,8 @@ def generate_glb_from_image_bytes_list(
                         print("[worker] pipe.run OOM after all 13 quality degradation attempts", flush=True)
                         raise RuntimeError("Worker ran out of memory, model was too complex.") from e
 
-                # Handle non-OOM errors: empty sparse sampling retry with seed shift
-                if not _is_empty_sparse_error(e):
+                # Handle non-OOM retryable errors with seed shift/fallback image.
+                if not _is_retryable_generation_error(e):
                     raise
 
                 attempt += 1
@@ -1095,6 +1231,10 @@ def generate_glb_from_image_bytes_list(
                 export_meta["shape_slat_steps"] = kwargs["shape_slat_sampler_params"].get("steps")
             if "tex_slat_sampler_params" in kwargs and isinstance(kwargs.get("tex_slat_sampler_params"), dict):
                 export_meta["tex_slat_steps"] = kwargs["tex_slat_sampler_params"].get("steps")
+            if mesh_axis_stats is not None:
+                export_meta["mesh_min_extent"] = float(mesh_axis_stats[0])
+                export_meta["mesh_max_extent"] = float(mesh_axis_stats[1])
+                export_meta["mesh_thin_axis_ratio"] = float(mesh_axis_stats[2])
 
         for glb_attempt in range(_int_env("TRELLIS2_TO_GLB_OOM_RETRIES", 4)):
             to_glb_attempts = glb_attempt + 1
