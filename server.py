@@ -42,6 +42,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from worker import (
     generate_glb_from_image_bytes_list,
     get_ready_state,
+    normalize_generation_request,
     start_preload_in_background,
 )
 
@@ -122,6 +123,18 @@ def _parse_float(
     return x
 
 
+def _parse_int(v: Optional[str], default: Optional[int] = None) -> Optional[int]:
+    if v is None:
+        return default
+    s = str(v).strip()
+    if not s:
+        return default
+    try:
+        return int(s)
+    except Exception:
+        return default
+
+
 @app.post("/generate")
 async def generate(
     image: Optional[UploadFile] = File(None),
@@ -133,6 +146,17 @@ async def generate(
     post_scale_z: Optional[str] = Form(None),
     backup_inputs: Optional[str] = Form(None),
     decimation_target: Optional[str] = Form(None),
+    mesh_profile: Optional[str] = Form(None),
+    geometry_resolution: Optional[str] = Form(None),
+    texture_generation_mode: Optional[str] = Form(None),
+    texture_output_size: Optional[str] = Form(None),
+    steps: Optional[str] = Form(None),
+    # Legacy aliases retained for compatibility.
+    resolution: Optional[str] = Form(None),
+    texture_mode: Optional[str] = Form(None),
+    texture_size: Optional[str] = Form(None),
+    hd: Optional[str] = Form(None),
+    quality: Optional[str] = Form(None),
 ):
     export_meta: dict = {}
     try:
@@ -146,14 +170,33 @@ async def generate(
                 safe_seed = int(str(seed).strip())
             except Exception:
                 safe_seed = None
-        safe_decimation_target = None
-        if decimation_target is not None and str(decimation_target).strip():
-            try:
-                v = int(str(decimation_target).strip())
-                if v > 0:
-                    safe_decimation_target = v
-            except Exception:
-                safe_decimation_target = None
+        safe_decimation_target = _parse_int(decimation_target, default=None)
+        raw_request = {
+            "mesh_profile": mesh_profile,
+            "geometry_resolution": _parse_int(geometry_resolution, default=None),
+            "decimation_target": safe_decimation_target,
+            "texture_generation_mode": texture_generation_mode,
+            "texture_output_size": _parse_int(texture_output_size, default=None),
+            "steps": _parse_int(steps, default=None),
+            # Legacy compatibility.
+            "low_poly": want_low_poly,
+            "pipeline_type": str(pipeline_type).strip() if pipeline_type else None,
+            "resolution": _parse_int(resolution, default=None),
+            "texture_mode": texture_mode,
+            "texture_size": _parse_int(texture_size, default=None),
+            "enable_hd": _parse_bool(hd, default=False),
+            "quality": quality,
+        }
+        normalized, adjustments = normalize_generation_request(raw_request, strict_4k_geometry=False)
+        for note in adjustments:
+            _log.info("request auto-adjustment: %s", note)
+        _log.info(
+            "request normalized geometry_resolution=%s texture_generation_mode=%s texture_bake_resolution=%s hd_enabled=%s",
+            normalized["geometry_resolution"],
+            normalized["texture_generation_mode"],
+            normalized["texture_output_size"],
+            1 if normalized["enable_hd"] else 0,
+        )
 
         uploads: List[UploadFile] = []
         if images:
@@ -180,14 +223,19 @@ async def generate(
                 generate_glb_from_image_bytes_list,
                 raw_list,
                 out_dir=OUTPUT_DIR,
-                low_poly=want_low_poly,
+                low_poly=bool(normalized["mesh_profile"] == "game_ready"),
                 seed=safe_seed,
-                pipeline_type=str(pipeline_type).strip() if pipeline_type else None,
+                pipeline_type=normalized["pipeline_type"],
                 preprocess_image=want_preprocess,
                 post_scale_z=want_post_scale_z,
                 backup_inputs=want_backup,
                 export_meta=export_meta,
-                decimation_target=safe_decimation_target,
+                decimation_target=normalized["decimation_target"],
+                mesh_profile=normalized["mesh_profile"],
+                geometry_resolution=normalized["geometry_resolution"],
+                texture_generation_mode=normalized["texture_generation_mode"],
+                texture_output_size=normalized["texture_output_size"],
+                steps=normalized["steps"],
             )
         )
         resp = {"success": True, "glb_path": str(out_path)}

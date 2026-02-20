@@ -819,6 +819,133 @@ def _get_fused_cond(pipe, images: List[Image.Image], resolution: int):
 # Generation helpers
 # ---------------------------------------------------------------------------
 
+ALLOWED_MESH_PROFILES = {"game_ready", "hd"}
+ALLOWED_GEOMETRY_RESOLUTIONS = {512, 1024, 1536}
+ALLOWED_TEXTURE_MODES = {"fast_512", "native_1024", "cascade_512_1024"}
+ALLOWED_TEXTURE_SIZES = {1024, 2048, 4096}
+
+
+def _normalize_mesh_profile(raw: dict) -> str:
+    mesh_profile = str(raw.get("mesh_profile") or "").strip().lower()
+    if mesh_profile in ALLOWED_MESH_PROFILES:
+        return mesh_profile
+    if bool(raw.get("enable_hd")):
+        return "hd"
+    if str(raw.get("low_poly") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "game_ready"
+    if str(raw.get("quality") or "").strip().lower() == "game_ready":
+        return "game_ready"
+    return "hd"
+
+
+def _normalize_geometry_resolution(raw: dict, mesh_profile: str) -> int:
+    value = raw.get("geometry_resolution", raw.get("resolution"))
+    if value is None:
+        p = str(raw.get("pipeline_type") or "").strip().lower()
+        if p == "512":
+            return 512
+        if p == "1024":
+            return 1024
+        if p in {"1024_cascade", "cascade_512_1024"}:
+            return 1536
+        return 512 if mesh_profile == "game_ready" else 1024
+    try:
+        n = int(str(value).strip())
+    except Exception:
+        n = 1024
+    if n not in ALLOWED_GEOMETRY_RESOLUTIONS:
+        n = min(ALLOWED_GEOMETRY_RESOLUTIONS, key=lambda x: abs(x - n))
+    return int(n)
+
+
+def _normalize_texture_mode(raw: dict) -> str:
+    mode = str(raw.get("texture_generation_mode") or raw.get("texture_mode") or "").strip().lower()
+    if mode in ALLOWED_TEXTURE_MODES:
+        return mode
+    p = str(raw.get("pipeline_type") or "").strip().lower()
+    if p == "512":
+        return "fast_512"
+    if p == "1024":
+        return "native_1024"
+    if p in {"1024_cascade", "cascade_512_1024"}:
+        return "cascade_512_1024"
+    return "native_1024"
+
+
+def _normalize_texture_size(raw: dict, mesh_profile: str) -> int:
+    value = raw.get("texture_output_size", raw.get("texture_size"))
+    if value is None:
+        return 2048 if mesh_profile == "game_ready" else 4096
+    try:
+        n = int(str(value).strip())
+    except Exception:
+        n = 2048
+    if n not in ALLOWED_TEXTURE_SIZES:
+        n = min(ALLOWED_TEXTURE_SIZES, key=lambda x: abs(x - n))
+    return int(n)
+
+
+def _texture_mode_to_pipeline_type(texture_mode: str) -> str:
+    if texture_mode == "fast_512":
+        return "512"
+    if texture_mode == "cascade_512_1024":
+        return "1024_cascade"
+    return "1024"
+
+
+def normalize_generation_request(raw: dict, *, strict_4k_geometry: bool = False) -> tuple[dict, list[str]]:
+    """
+    Normalize request fields while keeping legacy compatibility.
+    Separates geometry, texture generation strategy, and bake texture resolution.
+    """
+    adjustments: list[str] = []
+
+    mesh_profile = _normalize_mesh_profile(raw)
+    geometry_resolution = _normalize_geometry_resolution(raw, mesh_profile)
+    texture_generation_mode = _normalize_texture_mode(raw)
+    texture_output_size = _normalize_texture_size(raw, mesh_profile)
+    steps_raw = raw.get("steps")
+    try:
+        steps = int(str(steps_raw).strip()) if steps_raw is not None else 12
+    except Exception:
+        steps = 12
+    steps = max(1, int(steps))
+
+    default_decimation = 150000 if mesh_profile == "game_ready" else 2000000
+    decimation_raw = raw.get("decimation_target")
+    try:
+        decimation_target = int(str(decimation_raw).strip()) if decimation_raw is not None else default_decimation
+    except Exception:
+        decimation_target = default_decimation
+    decimation_target = max(1, int(decimation_target))
+
+    if texture_output_size == 4096 and geometry_resolution < 1024:
+        if strict_4k_geometry:
+            raise ValueError("texture_output_size=4096 requires geometry_resolution >= 1024")
+        texture_output_size = 2048
+        adjustments.append("downgraded texture_output_size 4096->2048 because geometry_resolution < 1024")
+
+    if mesh_profile == "game_ready" and decimation_target > 300000:
+        decimation_target = 300000
+        adjustments.append("capped decimation_target to 300000 for mesh_profile=game_ready")
+
+    if texture_generation_mode == "fast_512" and texture_output_size > 2048:
+        texture_output_size = 2048
+        adjustments.append("downgraded texture_output_size to 2048 for texture_generation_mode=fast_512")
+
+    normalized = {
+        "mesh_profile": mesh_profile,
+        "geometry_resolution": int(geometry_resolution),
+        "decimation_target": int(decimation_target),
+        "texture_generation_mode": texture_generation_mode,
+        "texture_output_size": int(texture_output_size),
+        "steps": int(steps),
+        "pipeline_type": _texture_mode_to_pipeline_type(texture_generation_mode),
+        "enable_hd": bool(mesh_profile == "hd"),
+    }
+    return normalized, adjustments
+
+
 def _resolve_pipeline_type(requested: Optional[str]) -> str:
     v = (requested or "").strip()
     if v:
@@ -826,12 +953,12 @@ def _resolve_pipeline_type(requested: Optional[str]) -> str:
     return os.environ.get("TRELLIS2_PIPELINE_TYPE", "1024_cascade").strip() or "1024_cascade"
 
 
-def _choose_export_params(low_poly: bool, decimation_target: Optional[int] = None):
-    if low_poly:
-        dec = decimation_target if decimation_target and decimation_target > 0 else _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 75000)
-        return (dec, _int_env("TRELLIS2_TEXTURE_SIZE_LOW_POLY", 2048))
-    dec = decimation_target if decimation_target and decimation_target > 0 else _int_env("TRELLIS2_DECIMATION_TARGET", 1000000)
-    return (dec, _int_env("TRELLIS2_TEXTURE_SIZE", 4096))
+def _choose_decimation_target(mesh_profile: str, decimation_target: Optional[int] = None) -> int:
+    if decimation_target and decimation_target > 0:
+        return int(decimation_target)
+    if mesh_profile == "game_ready":
+        return _int_env("TRELLIS2_DECIMATION_TARGET_LOW_POLY", 75000)
+    return _int_env("TRELLIS2_DECIMATION_TARGET", 1000000)
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +976,11 @@ def generate_glb_from_image_bytes_list(
     backup_inputs: bool = True,
     export_meta: Optional[dict] = None,
     decimation_target: Optional[int] = None,
+    mesh_profile: Optional[str] = None,
+    geometry_resolution: Optional[int] = None,
+    texture_generation_mode: Optional[str] = None,
+    texture_output_size: Optional[int] = None,
+    steps: Optional[int] = None,
 ) -> Path:
     if not images_bytes:
         raise ValueError("empty upload")
@@ -856,6 +988,31 @@ def generate_glb_from_image_bytes_list(
     _cuda_empty_cache()
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+
+    normalized_request, payload_adjustments = normalize_generation_request(
+        {
+            "mesh_profile": mesh_profile,
+            "resolution": geometry_resolution,
+            "decimation_target": decimation_target,
+            "texture_mode": texture_generation_mode,
+            "texture_size": texture_output_size,
+            "steps": steps,
+            "low_poly": low_poly,
+            "pipeline_type": pipeline_type,
+        },
+        strict_4k_geometry=False,
+    )
+    for note in payload_adjustments:
+        print(f"[worker] request auto-adjustment: {note}", flush=True)
+    print(
+        "[worker] request settings: "
+        f"geometry_resolution={normalized_request['geometry_resolution']} "
+        f"texture_generation_mode={normalized_request['texture_generation_mode']} "
+        f"texture_bake_resolution={normalized_request['texture_output_size']} "
+        f"mesh_profile={normalized_request['mesh_profile']} "
+        f"hd_enabled={1 if normalized_request['enable_hd'] else 0}",
+        flush=True,
+    )
 
     pipe = _get_pipeline()
     try:
@@ -882,7 +1039,10 @@ def generate_glb_from_image_bytes_list(
         import inspect
         import o_voxel  # type: ignore
 
-        ptype = _resolve_pipeline_type(pipeline_type)
+        # Texture generation strategy controls internal pipeline family.
+        # Geometry resolution and UV texture bake size are handled separately.
+        requested_steps = int(normalized_request["steps"])
+        ptype = _resolve_pipeline_type(str(normalized_request["pipeline_type"] or pipeline_type or ""))
         img0_raw = imgs_raw[0]
 
         import torch
@@ -902,6 +1062,8 @@ def generate_glb_from_image_bytes_list(
                 kwargs["seed"] = int(seed)
             if ptype and "pipeline_type" in sig.parameters:
                 kwargs["pipeline_type"] = ptype
+            if "resolution" in sig.parameters:
+                kwargs["resolution"] = int(normalized_request["geometry_resolution"])
             if "num_samples" in sig.parameters:
                 kwargs["num_samples"] = 1
             if "preprocess_image" in sig.parameters:
@@ -909,21 +1071,21 @@ def generate_glb_from_image_bytes_list(
             if _bool_env("TRELLIS2_USE_DEMO_SAMPLER_DEFAULTS", True):
                 if "sparse_structure_sampler_params" in sig.parameters:
                     kwargs["sparse_structure_sampler_params"] = {
-                        "steps": _int_env("TRELLIS2_SS_STEPS", 12),
+                        "steps": requested_steps,
                         "guidance_strength": _float_env("TRELLIS2_SS_GUIDANCE_STRENGTH", 7.5),
                         "guidance_rescale": _float_env("TRELLIS2_SS_GUIDANCE_RESCALE", 0.7),
                         "rescale_t": _float_env("TRELLIS2_SS_RESCALE_T", 5.0),
                     }
                 if "shape_slat_sampler_params" in sig.parameters:
                     kwargs["shape_slat_sampler_params"] = {
-                        "steps": _int_env("TRELLIS2_SHAPE_STEPS", 12),
+                        "steps": requested_steps,
                         "guidance_strength": _float_env("TRELLIS2_SHAPE_GUIDANCE_STRENGTH", 7.5),
                         "guidance_rescale": _float_env("TRELLIS2_SHAPE_GUIDANCE_RESCALE", 0.5),
                         "rescale_t": _float_env("TRELLIS2_SHAPE_RESCALE_T", 3.0),
                     }
                 if "tex_slat_sampler_params" in sig.parameters:
                     kwargs["tex_slat_sampler_params"] = {
-                        "steps": _int_env("TRELLIS2_TEX_STEPS", 12),
+                        "steps": requested_steps,
                         "guidance_strength": _float_env("TRELLIS2_TEX_GUIDANCE_STRENGTH", 1.0),
                         "guidance_rescale": _float_env("TRELLIS2_TEX_GUIDANCE_RESCALE", 0.0),
                         "rescale_t": _float_env("TRELLIS2_TEX_RESCALE_T", 3.0),
@@ -1207,7 +1369,12 @@ def generate_glb_from_image_bytes_list(
 
         # Export to GLB via o-voxel postprocess util.
         _cuda_empty_cache()
-        decimation_target, texture_size = _choose_export_params(low_poly, decimation_target=decimation_target)
+        # Keep geometry complexity and UV bake resolution independent.
+        decimation_target = _choose_decimation_target(
+            str(normalized_request["mesh_profile"]),
+            decimation_target=int(normalized_request["decimation_target"]),
+        )
+        texture_size = int(normalized_request["texture_output_size"])
         decimation_initial = int(decimation_target)
         uid = uuid.uuid4().hex
         dec_min = _int_env("TRELLIS2_DECIMATION_MIN_OOM_FALLBACK", 15000)
@@ -1219,11 +1386,15 @@ def generate_glb_from_image_bytes_list(
         if export_meta is not None:
             export_meta.update({
                 "pipeline_type": ptype,
-                "low_poly": low_poly,
+                "low_poly": bool(str(normalized_request["mesh_profile"]) == "game_ready"),
+                "mesh_profile": str(normalized_request["mesh_profile"]),
+                "geometry_resolution": int(normalized_request["geometry_resolution"]),
+                "texture_generation_mode": str(normalized_request["texture_generation_mode"]),
                 "texture_size": int(texture_size),
                 "decimation_initial": decimation_initial,
                 "input_image_count": len(images_bytes),
                 "oom_quality_degradation_level": oom_quality_level,
+                "enable_hd": bool(normalized_request["enable_hd"]),
             })
             if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs.get("sparse_structure_sampler_params"), dict):
                 export_meta["sparse_structure_steps"] = kwargs["sparse_structure_sampler_params"].get("steps")
@@ -1274,6 +1445,11 @@ def generate_glb_from_image_bytes_list(
                         "decimation_final": int(decimation_target),
                         "error_snippet": (str(e) or "")[:500],
                     })
+                if _is_cuda_oom(e):
+                    raise RuntimeError(
+                        "GPU OOM during UV texture bake "
+                        f"(texture_size={int(texture_size)}, decimation_target={int(decimation_target)})."
+                    ) from e
                 raise
         if glb is None:
             if export_meta is not None:
@@ -1283,6 +1459,11 @@ def generate_glb_from_image_bytes_list(
                     "to_glb_attempts": to_glb_attempts,
                     "decimation_final": int(decimation_target),
                 })
+            if last_glb_err is not None and _is_cuda_oom(last_glb_err):
+                raise RuntimeError(
+                    "GPU OOM during UV texture bake after retries "
+                    f"(texture_size={int(texture_size)}, decimation_target={int(decimation_target)})."
+                ) from last_glb_err
             raise RuntimeError("to_glb failed") from last_glb_err
 
         # Extract mesh statistics
@@ -1292,6 +1473,15 @@ def generate_glb_from_image_bytes_list(
             print(
                 f"[worker] GLB export complete: {glb_vert_count} vertices, {glb_face_count} faces "
                 f"(decimation_target={decimation_target}, texture_size={texture_size})",
+                flush=True,
+            )
+            print(
+                "[worker] final settings: "
+                f"geometry_resolution={normalized_request['geometry_resolution']} "
+                f"texture_generation_mode={normalized_request['texture_generation_mode']} "
+                f"texture_bake_resolution={texture_size} "
+                f"final_polygon_count={glb_face_count} "
+                f"hd_enabled={1 if normalized_request['enable_hd'] else 0}",
                 flush=True,
             )
             if export_meta is not None:
