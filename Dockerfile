@@ -269,6 +269,35 @@ RUN mkdir -p /tmp/extensions \
     && cp -r /opt/trellis2/src/o-voxel /tmp/extensions/o-voxel \
     && pip install /tmp/extensions/o-voxel --no-build-isolation
 
+# Pre-download model weights into the image so startup doesn't spend 10+ min
+# fetching from HuggingFace Hub every time a fresh container launches.
+# This layer is placed before COPY so code-only changes don't invalidate it.
+ARG TRELLIS2_MODEL_ID="microsoft/TRELLIS.2-4B"
+ARG TRELLIS2_REMBG_MODEL_ID="ZhengPeng7/BiRefNet"
+RUN python - <<'PY'
+import os, subprocess, sys
+
+def hf_download(repo_id: str):
+    print(f"[pre-download] {repo_id}", flush=True)
+    subprocess.check_call(
+        [sys.executable, "-m", "huggingface_hub", "download", "--repo-type", "model", repo_id],
+    )
+
+hf_download(os.environ.get("TRELLIS2_MODEL_ID", "microsoft/TRELLIS.2-4B"))
+hf_download("microsoft/TRELLIS-image-large")
+hf_download(os.environ.get("TRELLIS2_REMBG_MODEL_ID", "ZhengPeng7/BiRefNet"))
+
+# DINOv2 weights are fetched via torch.hub at runtime; pre-cache them now.
+# Best-effort: model init may fail without a GPU, but the file download is
+# what matters for startup speed.
+try:
+    import torch
+    torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg", pretrained=True)
+    print("[pre-download] dinov2_vitl14_reg OK", flush=True)
+except Exception as e:
+    print(f"[pre-download] dinov2_vitl14_reg best-effort failed: {e}", flush=True)
+PY
+
 COPY server.py /app/server.py
 COPY worker.py /app/worker.py
 
