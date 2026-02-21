@@ -279,14 +279,13 @@ RUN rm -rf /tmp/extensions
 ARG TRELLIS2_MODEL_ID="microsoft/TRELLIS.2-4B"
 ARG TRELLIS2_REMBG_MODEL_ID="ZhengPeng7/BiRefNet"
 
-RUN pip install --upgrade "huggingface_hub[cli]" \
-    && huggingface-cli download --repo-type model "${TRELLIS2_MODEL_ID}" \
+RUN python -m huggingface_hub download --repo-type model "${TRELLIS2_MODEL_ID}" \
     && echo "[pre-download] ${TRELLIS2_MODEL_ID} OK"
 
-RUN huggingface-cli download --repo-type model microsoft/TRELLIS-image-large \
+RUN python -m huggingface_hub download --repo-type model microsoft/TRELLIS-image-large \
     && echo "[pre-download] microsoft/TRELLIS-image-large OK"
 
-RUN huggingface-cli download --repo-type model "${TRELLIS2_REMBG_MODEL_ID}" \
+RUN python -m huggingface_hub download --repo-type model "${TRELLIS2_REMBG_MODEL_ID}" \
     && echo "[pre-download] ${TRELLIS2_REMBG_MODEL_ID} OK"
 
 # DINOv2 weights are fetched via torch.hub at runtime; pre-cache them now.
