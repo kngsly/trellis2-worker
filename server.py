@@ -9,6 +9,15 @@ Endpoints:
   - GET  /download/{filename} -> returns file bytes
 
 Response shape mirrors other workers so a client can reuse the same protocol.
+
+Usage:
+  Default (no idle shutdown):
+    python3 server.py
+    uvicorn server:app
+
+  With idle shutdown and custom timeouts:
+    python3 server.py --idle-shutdown --idle-after-ready-sec 600 --idle-after-generation-sec 180
+    uvicorn server:app  # then set env: TRELLIS2_IDLE_SHUTDOWN=1 TRELLIS2_IDLE_SHUTDOWN_AFTER_READY_SEC=600 TRELLIS2_IDLE_SHUTDOWN_AFTER_GENERATION_SEC=180
 """
 
 from __future__ import annotations
@@ -36,13 +45,51 @@ logging.basicConfig(
 _log = logging.getLogger(__name__)
 _log.info("worker process starting")
 
+
+def _parse_server_args():
+    import argparse
+    p = argparse.ArgumentParser(description="TRELLIS.2 worker server")
+    p.add_argument(
+        "--idle-shutdown",
+        action="store_true",
+        help="Enable idle shutdown (exit after idle/generation timeouts). Default: disabled.",
+    )
+    p.add_argument(
+        "--idle-after-ready-sec",
+        type=int,
+        default=300,
+        metavar="SEC",
+        help="Seconds idle after ready before exit (default: 300). Only used if --idle-shutdown.",
+    )
+    p.add_argument(
+        "--idle-after-generation-sec",
+        type=int,
+        default=120,
+        metavar="SEC",
+        help="Seconds idle after last generation before exit (default: 120). Only used if --idle-shutdown.",
+    )
+    return p.parse_known_args()
+
+
+def _apply_server_args():
+    args, _ = _parse_server_args()
+    os.environ["TRELLIS2_IDLE_SHUTDOWN"] = "1" if args.idle_shutdown else "0"
+    os.environ["TRELLIS2_IDLE_SHUTDOWN_AFTER_READY_SEC"] = str(args.idle_after_ready_sec)
+    os.environ["TRELLIS2_IDLE_SHUTDOWN_AFTER_GENERATION_SEC"] = str(args.idle_after_generation_sec)
+    return args
+
+
+_apply_server_args()
+
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import FileResponse, JSONResponse
 
 from worker import (
+    cancel_idle_shutdown,
     generate_glb_from_image_bytes_list,
     get_ready_state,
     normalize_generation_request,
+    schedule_idle_shutdown_after_generation,
     start_preload_in_background,
 )
 
@@ -216,6 +263,8 @@ async def generate(
         if not raw_list:
             return JSONResponse({"success": False, "error": "empty upload(s)"}, status_code=200)
 
+        cancel_idle_shutdown()
+
         # Run the blocking CUDA generation in a thread so the event loop stays
         # responsive for /health and /ready probes during long jobs.
         out_path = await asyncio.to_thread(
@@ -238,11 +287,13 @@ async def generate(
                 steps=normalized["steps"],
             )
         )
+        schedule_idle_shutdown_after_generation()
         resp = {"success": True, "glb_path": str(out_path)}
         if export_meta:
             resp["worker_export"] = export_meta
         return JSONResponse(resp, status_code=200)
     except Exception:
+        schedule_idle_shutdown_after_generation()
         tb = traceback.format_exc()
         if len(tb) > 20000:
             tb = tb[:20000] + "\n...[truncated]...\n"
@@ -262,7 +313,50 @@ def download(filename: str):
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
 
-    _log.info("starting uvicorn on 0.0.0.0:%s", APP_PORT)
-    uvicorn.run(app, host="0.0.0.0", port=APP_PORT, log_level="info")
+    parser = argparse.ArgumentParser(
+        description="TRELLIS.2 image-to-3D worker server.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--idle-shutdown",
+        action="store_true",
+        help="Enable idle shutdown: exit after N s with no generation (after ready) or after last job.",
+    )
+    parser.add_argument(
+        "--idle-after-ready-sec",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help="Seconds with no generation after server ready before exit. Implies --idle-shutdown if set.",
+    )
+    parser.add_argument(
+        "--idle-after-generation-sec",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help="Seconds with no new generation after last job before exit. Implies --idle-shutdown if set.",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Bind host for uvicorn.")
+    parser.add_argument("--port", type=int, default=None, help="Bind port (default: PORT env or 8000).")
+    args = parser.parse_args()
+
+    if args.idle_shutdown or args.idle_after_ready_sec is not None or args.idle_after_generation_sec is not None:
+        from worker import configure_idle_shutdown
+
+        configure_idle_shutdown(
+            enabled=args.idle_shutdown or (args.idle_after_ready_sec is not None) or (args.idle_after_generation_sec is not None),
+            after_ready_sec=args.idle_after_ready_sec,
+            after_generation_sec=args.idle_after_generation_sec,
+        )
+        _log.info(
+            "idle shutdown: enabled (after_ready_sec=%s, after_generation_sec=%s)",
+            args.idle_after_ready_sec,
+            args.idle_after_generation_sec,
+        )
+
+    port = args.port if args.port is not None else APP_PORT
+    _log.info("starting uvicorn on %s:%s", args.host, port)
+    uvicorn.run(app, host=args.host, port=port, log_level="info")

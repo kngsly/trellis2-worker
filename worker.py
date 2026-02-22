@@ -12,6 +12,7 @@ import io
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -34,6 +35,58 @@ _READY = {
 }
 _READY_LOCK = threading.Lock()
 _CUDA_RUNTIME_PREPARED = False
+
+# Idle shutdown: if no generation after ready for N sec, or no new generation for N sec after last job, exit (backup so server does not idle forever).
+# Disabled by default; enable via TRELLIS2_IDLE_SHUTDOWN=1 or --idle-shutdown (see server.py).
+_IDLE_SHUTDOWN_TIMER: Optional[threading.Timer] = None
+_IDLE_SHUTDOWN_LOCK = threading.Lock()
+# Overrides set by server.py from CLI (or can be set programmatically). None = use env.
+_IDLE_SHUTDOWN_ENABLED_OVERRIDE: Optional[bool] = None
+_IDLE_AFTER_READY_SEC_OVERRIDE: Optional[int] = None
+_IDLE_AFTER_GENERATION_SEC_OVERRIDE: Optional[int] = None
+
+
+def configure_idle_shutdown(
+    enabled: Optional[bool] = None,
+    after_ready_sec: Optional[int] = None,
+    after_generation_sec: Optional[int] = None,
+) -> None:
+    """
+    Override idle shutdown config (e.g. from CLI). None leaves existing override or env unchanged.
+    Call before starting the server when using python server.py --idle-shutdown ...
+    """
+    global _IDLE_SHUTDOWN_ENABLED_OVERRIDE, _IDLE_AFTER_READY_SEC_OVERRIDE, _IDLE_AFTER_GENERATION_SEC_OVERRIDE
+    if enabled is not None:
+        _IDLE_SHUTDOWN_ENABLED_OVERRIDE = enabled
+    if after_ready_sec is not None:
+        _IDLE_AFTER_READY_SEC_OVERRIDE = after_ready_sec
+    if after_generation_sec is not None:
+        _IDLE_AFTER_GENERATION_SEC_OVERRIDE = after_generation_sec
+
+
+def _idle_shutdown_enabled() -> bool:
+    if _IDLE_SHUTDOWN_ENABLED_OVERRIDE is not None:
+        return _IDLE_SHUTDOWN_ENABLED_OVERRIDE
+    v = str(os.environ.get("TRELLIS2_IDLE_SHUTDOWN", "")).strip().lower()
+    return v in ("1", "true", "t", "yes", "y", "on")
+
+
+def _idle_after_ready_sec() -> int:
+    if _IDLE_AFTER_READY_SEC_OVERRIDE is not None:
+        return _IDLE_AFTER_READY_SEC_OVERRIDE
+    try:
+        return int(str(os.environ.get("TRELLIS2_IDLE_SHUTDOWN_AFTER_READY_SEC", "300")).strip() or "300")
+    except Exception:
+        return 300
+
+
+def _idle_after_generation_sec() -> int:
+    if _IDLE_AFTER_GENERATION_SEC_OVERRIDE is not None:
+        return _IDLE_AFTER_GENERATION_SEC_OVERRIDE
+    try:
+        return int(str(os.environ.get("TRELLIS2_IDLE_SHUTDOWN_AFTER_GENERATION_SEC", "120")).strip() or "120")
+    except Exception:
+        return 120
 
 
 def _get_device():
@@ -403,6 +456,59 @@ def get_ready_state() -> dict:
         return dict(_READY)
 
 
+# ---------------------------------------------------------------------------
+# Idle shutdown (backup: exit if no work after ready, or after last generation)
+# ---------------------------------------------------------------------------
+
+def _on_idle_shutdown_fire():
+    _log.info("idle shutdown: no activity within window, exiting process")
+    print("[worker] idle shutdown: exiting", flush=True)
+    sys.exit(0)
+
+
+def _schedule_idle_shutdown(seconds: float) -> None:
+    """Schedule process exit in `seconds` if not cancelled. Cancels any existing timer."""
+    global _IDLE_SHUTDOWN_TIMER
+    with _IDLE_SHUTDOWN_LOCK:
+        if _IDLE_SHUTDOWN_TIMER is not None:
+            _IDLE_SHUTDOWN_TIMER.cancel()
+            _IDLE_SHUTDOWN_TIMER = None
+        if seconds <= 0:
+            return
+        _IDLE_SHUTDOWN_TIMER = threading.Timer(seconds, _on_idle_shutdown_fire)
+        _IDLE_SHUTDOWN_TIMER.daemon = True
+        _IDLE_SHUTDOWN_TIMER.start()
+        _log.info("idle shutdown: scheduled exit in %.0fs", seconds)
+
+
+def cancel_idle_shutdown() -> None:
+    """Cancel any scheduled idle shutdown (e.g. when a generate request starts)."""
+    global _IDLE_SHUTDOWN_TIMER
+    with _IDLE_SHUTDOWN_LOCK:
+        if _IDLE_SHUTDOWN_TIMER is not None:
+            _IDLE_SHUTDOWN_TIMER.cancel()
+            _IDLE_SHUTDOWN_TIMER = None
+            _log.info("idle shutdown: cancelled")
+
+
+def schedule_idle_shutdown_after_generation() -> None:
+    """Call after a generate completes: reset timer so we exit if no new job in N sec."""
+    if not _idle_shutdown_enabled():
+        return
+    _schedule_idle_shutdown(float(_idle_after_generation_sec()))
+
+
+def _on_ready_start_idle_timer() -> None:
+    """Call once when server becomes ready and queue is effectively empty: exit if no generation for N sec."""
+    if not _idle_shutdown_enabled():
+        return
+    sec = _idle_after_ready_sec()
+    if sec <= 0:
+        return
+    _schedule_idle_shutdown(float(sec))
+    _log.info("idle shutdown: ready with no job; will exit in %s s if no generation", sec)
+
+
 def _preload_worker():
     try:
         _log.info("preload: starting model preload")
@@ -414,6 +520,7 @@ def _preload_worker():
             dt = float(st["ready_at"]) - float(st["started_at"])
         _log.info("preload: ready (load_time_sec=%.1f)", dt)
         print(f"[worker] preload: ready (load_time_sec={dt:.1f})", flush=True)
+        _on_ready_start_idle_timer()
     except Exception:
         tb = traceback.format_exc()
         with _READY_LOCK:
