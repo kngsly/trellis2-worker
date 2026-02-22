@@ -41,6 +41,30 @@ Notes:
 - `TRELLIS2_AVOID_GATED_DEPS=1` (default) avoids gated Hugging Face repos (e.g. DINOv3) by switching the image-conditioning backbone to DINOv2.
 - If you later get approved for gated repos and want the upstream default behavior, run with `-e TRELLIS2_AVOID_GATED_DEPS=0`.
 
+## Idle shutdown
+
+Idle shutdown is **disabled by default**. When enabled, the process exits after a period of no activity so the server does not sit idle indefinitely (e.g. on spot/preemptible GPU VMs).
+
+- **Enable via CLI** (when starting the process directly, e.g. `python3 server.py`):
+  - `--idle-shutdown` — turn idle shutdown on
+  - `--idle-after-ready-sec SEC` — seconds with no job after the model becomes ready before exit (default: 300)
+  - `--idle-after-generation-sec SEC` — seconds with no new job after the last generation before exit (default: 120)
+- **Enable via env** (e.g. in Docker): set `TRELLIS2_IDLE_SHUTDOWN=1`, and optionally:
+  - `TRELLIS2_IDLE_SHUTDOWN_AFTER_READY_SEC` (default: 300)
+  - `TRELLIS2_IDLE_SHUTDOWN_AFTER_GENERATION_SEC` (default: 120)
+
+Example with env (Docker):
+
+```bash
+docker run -d --name trellis2-worker --gpus all \
+  -e TRELLIS2_IDLE_SHUTDOWN=1 \
+  -e TRELLIS2_IDLE_SHUTDOWN_AFTER_READY_SEC=600 \
+  -e TRELLIS2_IDLE_SHUTDOWN_AFTER_GENERATION_SEC=180 \
+  ...other options...
+```
+
+When idle shutdown is enabled, the worker exits (cleanly) after the configured idle window; an orchestrator or process manager can restart it when new work is available.
+
 ## Health / Ready
 
 ```bash
