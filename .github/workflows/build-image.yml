@@ -28,6 +28,8 @@ jobs:
           set -euo pipefail
           echo "=== Before cleanup ==="
           df -h /
+
+          # Original large removals
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /opt/ghc || true
@@ -38,8 +40,33 @@ jobs:
           sudo rm -rf /usr/local/share/powershell || true
           sudo rm -rf /usr/local/lib/heroku || true
           docker system prune -af || true
+
+          # Additional removals to make room for ~21 GB of model weights
+          sudo rm -rf /usr/lib/jvm || true
+          sudo rm -rf /usr/local/graalvm-ce-* || true
+          sudo rm -rf /usr/share/gradle-* || true
+          sudo rm -rf ~/.cargo || true
+          sudo rm -rf /opt/az || true
+          sudo rm -rf /usr/local/share/vcpkg || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+          sudo rm -rf /usr/share/rust || true
+          sudo apt-get clean || true
+          sudo apt-get autoremove -y || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+
           echo "=== After cleanup ==="
           df -h /
+
+          # Fail fast if there is not enough disk for the model weights.
+          # The image needs ~21 GB of model data + ~20 GB for CUDA/PyTorch layers.
+          AVAIL_GB=$(df -BG / | awk 'NR==2 {gsub("G",""); print $4}')
+          echo "Available disk: ${AVAIL_GB} GB"
+          if [ "${AVAIL_GB}" -lt 45 ]; then
+            echo "ERROR: Insufficient disk space for model weight download."
+            echo "       Need >= 45 GB available, have ${AVAIL_GB} GB."
+            echo "       Consider a self-hosted runner or local build + push."
+            exit 1
+          fi
 
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
@@ -79,6 +106,8 @@ jobs:
           echo "tags<<EOF" >> "$GITHUB_OUTPUT"
           echo "$TAGS" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+          # Expose the first tag separately for the verify step
+          echo "first_tag=$(echo "$TAGS" | head -1)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -98,3 +127,32 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=registry,ref=kngsly/trellis2-worker:buildcache
           cache-to: type=registry,ref=kngsly/trellis2-worker:buildcache,mode=max
+
+      - name: Verify model weights in image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.prep.outputs.first_tag }}"
+          echo "Verifying baked model weights in ${IMAGE}..."
+          docker run --rm "${IMAGE}" python - <<'PY'
+          import sys
+          from huggingface_hub import snapshot_download
+
+          models = [
+              "microsoft/TRELLIS.2-4B",
+              "microsoft/TRELLIS-image-large",
+              "ZhengPeng7/BiRefNet",
+          ]
+          failed = []
+          for repo_id in models:
+              try:
+                  path = snapshot_download(repo_id, repo_type="model", local_files_only=True)
+                  print(f"OK: {repo_id} -> {path}")
+              except Exception as e:
+                  print(f"MISSING: {repo_id}: {e}")
+                  failed.append(repo_id)
+          if failed:
+              print(f"\nERROR: {len(failed)} model(s) not found in image: {failed}")
+              sys.exit(1)
+          print("\nAll model weights verified.")
+          PY

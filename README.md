@@ -29,7 +29,7 @@ docker run -d --name trellis2-worker --gpus all \
   -e PORT=8000 \
   -e TRELLIS2_MODEL_ID="microsoft/TRELLIS.2-4B" \
   -e HF_TOKEN="$HF_TOKEN" \
-  -e TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=0 \
+  -e TRELLIS2_DISABLE_RUNTIME_DOWNLOADS=0 \
   -e TRELLIS2_AVOID_GATED_DEPS=1 \
   -e TRELLIS2_DINOV2_MODEL_NAME="dinov2_vitl14_reg" \
   -p 8000:8000 \
@@ -41,8 +41,8 @@ docker logs -f trellis2-worker
 Notes:
 - `TRELLIS2_AVOID_GATED_DEPS=1` (default) avoids gated Hugging Face repos (e.g. DINOv3) by switching the image-conditioning backbone to DINOv2.
 - If you later get approved for gated repos and want the upstream default behavior, run with `-e TRELLIS2_AVOID_GATED_DEPS=0`.
-- `TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=0` (default) forces local-cache-only model loading. If assets are missing, startup fails fast instead of downloading at runtime.
-- If you intentionally want on-demand downloads, run with `-e TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=1`.
+- Runtime downloads are **enabled by default**: if a model asset is missing from the image cache it is downloaded at startup automatically.
+- Set `TRELLIS2_DISABLE_RUNTIME_DOWNLOADS=1` to opt out and force local-cache-only loading. Startup fails fast if any asset is missing — useful to catch a broken build early.
 
 ### Model Asset Caching
 
@@ -54,7 +54,7 @@ Rebuild and run:
 
 ```bash
 docker build --progress=plain --no-cache -t <dockerhub_user>/<image_name>:<tag> .
-docker run ... -e TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=0 ...
+docker run ... -e TRELLIS2_DISABLE_RUNTIME_DOWNLOADS=1 ...
 ```
 
 ## Idle shutdown

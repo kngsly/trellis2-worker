@@ -292,9 +292,10 @@ def _is_gated_repo_error(exc: BaseException) -> bool:
 
 def _runtime_downloads_allowed() -> bool:
     """
-    If false (default), require all Hugging Face assets to already be cached locally.
+    If true (default), missing Hugging Face assets are downloaded at runtime.
+    Set TRELLIS2_DISABLE_RUNTIME_DOWNLOADS=1 to require all assets to be pre-baked.
     """
-    return _bool_env("TRELLIS2_ALLOW_RUNTIME_DOWNLOADS", False)
+    return not _bool_env("TRELLIS2_DISABLE_RUNTIME_DOWNLOADS", False)
 
 
 def _split_repo_and_subpath(ref: str) -> tuple[Optional[str], Optional[str]]:
@@ -339,9 +340,9 @@ def _resolve_model_snapshot(model_ref: str, purpose: str) -> str:
     except Exception as e:
         if local_only:
             raise RuntimeError(
-                f"{purpose}: local snapshot for '{repo_id}' not found while "
-                "TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=0. Rebuild the image with pre-downloaded "
-                f"assets or run with TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=1. Original error: {e}"
+                f"{purpose}: local snapshot for '{repo_id}' not found and runtime downloads "
+                "are disabled (TRELLIS2_DISABLE_RUNTIME_DOWNLOADS=1). Rebuild the image with "
+                f"pre-downloaded assets or unset TRELLIS2_DISABLE_RUNTIME_DOWNLOADS. Original error: {e}"
             ) from e
         raise
 
