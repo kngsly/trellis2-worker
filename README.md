@@ -29,6 +29,7 @@ docker run -d --name trellis2-worker --gpus all \
   -e PORT=8000 \
   -e TRELLIS2_MODEL_ID="microsoft/TRELLIS.2-4B" \
   -e HF_TOKEN="$HF_TOKEN" \
+  -e TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=0 \
   -e TRELLIS2_AVOID_GATED_DEPS=1 \
   -e TRELLIS2_DINOV2_MODEL_NAME="dinov2_vitl14_reg" \
   -p 8000:8000 \
@@ -40,6 +41,21 @@ docker logs -f trellis2-worker
 Notes:
 - `TRELLIS2_AVOID_GATED_DEPS=1` (default) avoids gated Hugging Face repos (e.g. DINOv3) by switching the image-conditioning backbone to DINOv2.
 - If you later get approved for gated repos and want the upstream default behavior, run with `-e TRELLIS2_AVOID_GATED_DEPS=0`.
+- `TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=0` (default) forces local-cache-only model loading. If assets are missing, startup fails fast instead of downloading at runtime.
+- If you intentionally want on-demand downloads, run with `-e TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=1`.
+
+### Model Asset Caching
+
+The Docker build pre-downloads required model repos into the image layers. Runtime then resolves from local snapshots first, including cross-repo pipeline dependencies.
+
+If you still see Hugging Face `302/307` log lines at runtime, that means the container is not using local-only loading (or was built from an older image).
+
+Rebuild and run:
+
+```bash
+docker build --progress=plain --no-cache -t <dockerhub_user>/<image_name>:<tag> .
+docker run ... -e TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=0 ...
+```
 
 ## Idle shutdown
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import io
+import json
 import logging
 import os
 import signal
@@ -289,7 +290,96 @@ def _is_gated_repo_error(exc: BaseException) -> bool:
     return False
 
 
-def _build_pipeline_with_image_cond_override(model_id: str):
+def _runtime_downloads_allowed() -> bool:
+    """
+    If false (default), require all Hugging Face assets to already be cached locally.
+    """
+    return _bool_env("TRELLIS2_ALLOW_RUNTIME_DOWNLOADS", False)
+
+
+def _split_repo_and_subpath(ref: str) -> tuple[Optional[str], Optional[str]]:
+    s = str(ref or "").strip()
+    if not s or s.startswith(("/", "./", "../")):
+        return None, None
+    parts = [p for p in s.split("/") if p]
+    if len(parts) < 3:
+        return None, None
+    return f"{parts[0]}/{parts[1]}", "/".join(parts[2:])
+
+
+def _resolve_model_snapshot(model_ref: str, purpose: str) -> str:
+    """
+    Resolve a HF model reference to a local snapshot directory.
+    """
+    ref = str(model_ref or "").strip()
+    if not ref:
+        raise RuntimeError(f"{purpose}: empty model reference")
+
+    if os.path.isdir(ref):
+        return ref
+
+    repo_id = ref
+    parsed_repo_id, _ = _split_repo_and_subpath(ref)
+    if parsed_repo_id:
+        repo_id = parsed_repo_id
+
+    local_only = not _runtime_downloads_allowed()
+
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_dir = snapshot_download(repo_id, repo_type="model", local_files_only=local_only)
+        _log.info(
+            "resolved model snapshot: ref=%s repo=%s local_only=%s path=%s",
+            ref,
+            repo_id,
+            local_only,
+            snapshot_dir,
+        )
+        return snapshot_dir
+    except Exception as e:
+        if local_only:
+            raise RuntimeError(
+                f"{purpose}: local snapshot for '{repo_id}' not found while "
+                "TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=0. Rebuild the image with pre-downloaded "
+                f"assets or run with TRELLIS2_ALLOW_RUNTIME_DOWNLOADS=1. Original error: {e}"
+            ) from e
+        raise
+
+
+def _link_cross_repo_dependencies(model_snapshot_dir: str) -> None:
+    """
+    Ensure cross-repo model references in pipeline.json resolve locally.
+    """
+    p = Path(model_snapshot_dir) / "pipeline.json"
+    if not p.exists():
+        return
+
+    cfg = json.loads(p.read_text(encoding="utf-8"))
+    models = (cfg.get("args") or {}).get("models") or {}
+    if not isinstance(models, dict):
+        return
+
+    snapshot_root = Path(model_snapshot_dir).resolve()
+    for ref in models.values():
+        if not isinstance(ref, str):
+            continue
+        repo_id, _ = _split_repo_and_subpath(ref)
+        if not repo_id:
+            continue
+
+        dep_snapshot = _resolve_model_snapshot(repo_id, f"pipeline dependency '{repo_id}'")
+        dep_root = Path(dep_snapshot).resolve()
+        if dep_root == snapshot_root:
+            continue
+
+        alias_path = Path(model_snapshot_dir) / repo_id
+        if alias_path.exists() or alias_path.is_symlink():
+            continue
+        alias_path.parent.mkdir(parents=True, exist_ok=True)
+        alias_path.symlink_to(dep_snapshot, target_is_directory=True)
+
+
+def _build_pipeline_with_image_cond_override(model_source: str):
     """
     Build a Trellis2ImageTo3DPipeline but override the image conditioning model
     to avoid gated dependencies (e.g. DINOv3 on HF).
@@ -300,7 +390,7 @@ def _build_pipeline_with_image_cond_override(model_id: str):
 
     Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
 
-    pipe = Pipeline.from_pretrained.__func__(Trellis2ImageTo3DPipeline, model_id, "pipeline.json")  # type: ignore[attr-defined]
+    pipe = Pipeline.from_pretrained.__func__(Trellis2ImageTo3DPipeline, model_source, "pipeline.json")  # type: ignore[attr-defined]
     args = getattr(pipe, "_pretrained_args", None) or {}
 
     dinov2_name = os.environ.get("TRELLIS2_DINOV2_MODEL_NAME", "dinov2_vitl14_reg").strip()
@@ -308,7 +398,8 @@ def _build_pipeline_with_image_cond_override(model_id: str):
 
     if _should_avoid_gated_rembg_deps():
         rembg_id = os.environ.get("TRELLIS2_REMBG_MODEL_ID", "ZhengPeng7/BiRefNet").strip()
-        args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_id}}
+        rembg_source = _resolve_model_snapshot(rembg_id, f"rembg model '{rembg_id}'")
+        args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_source}}
 
     pipe.sparse_structure_sampler = getattr(samplers, args["sparse_structure_sampler"]["name"])(  # type: ignore[attr-defined]
         **args["sparse_structure_sampler"]["args"]
@@ -346,7 +437,7 @@ def _build_pipeline_with_image_cond_override(model_id: str):
     return pipe
 
 
-def _build_pipeline_with_rembg_override(model_id: str):
+def _build_pipeline_with_rembg_override(model_source: str):
     """
     Build a Trellis2ImageTo3DPipeline but override only the rembg (background removal) model
     to avoid gated dependencies (e.g. briaai/RMBG-2.0 on HF) while keeping the default image
@@ -357,11 +448,12 @@ def _build_pipeline_with_rembg_override(model_id: str):
     from trellis2.modules import image_feature_extractor  # type: ignore
 
     Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
-    pipe = Pipeline.from_pretrained.__func__(Trellis2ImageTo3DPipeline, model_id, "pipeline.json")  # type: ignore[attr-defined]
+    pipe = Pipeline.from_pretrained.__func__(Trellis2ImageTo3DPipeline, model_source, "pipeline.json")  # type: ignore[attr-defined]
     args = getattr(pipe, "_pretrained_args", None) or {}
 
     rembg_id = os.environ.get("TRELLIS2_REMBG_MODEL_ID", "ZhengPeng7/BiRefNet").strip()
-    args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_id}}
+    rembg_source = _resolve_model_snapshot(rembg_id, f"rembg model '{rembg_id}'")
+    args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_source}}
 
     pipe.sparse_structure_sampler = getattr(samplers, args["sparse_structure_sampler"]["name"])(  # type: ignore[attr-defined]
         **args["sparse_structure_sampler"]["args"]
@@ -413,21 +505,23 @@ def _get_pipeline():
             _READY["detail"] = "initializing pipeline"
 
     model_id = os.environ.get("TRELLIS2_MODEL_ID", "microsoft/TRELLIS.2-4B")
+    model_source = _resolve_model_snapshot(model_id, f"pipeline model '{model_id}'")
+    _link_cross_repo_dependencies(model_source)
     Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
 
     try:
         if _should_avoid_gated_deps():
-            pipe = _build_pipeline_with_image_cond_override(model_id)
+            pipe = _build_pipeline_with_image_cond_override(model_source)
         elif _should_avoid_gated_rembg_deps():
-            pipe = _build_pipeline_with_rembg_override(model_id)
+            pipe = _build_pipeline_with_rembg_override(model_source)
         else:
-            pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
+            pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_source)
     except Exception as e:
         if _is_gated_repo_error(e):
             if _should_avoid_gated_deps():
-                pipe = _build_pipeline_with_image_cond_override(model_id)
+                pipe = _build_pipeline_with_image_cond_override(model_source)
             elif _should_avoid_gated_rembg_deps():
-                pipe = _build_pipeline_with_rembg_override(model_id)
+                pipe = _build_pipeline_with_rembg_override(model_source)
             else:
                 raise
         else:
