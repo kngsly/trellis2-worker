@@ -279,13 +279,22 @@ RUN rm -rf /tmp/extensions
 ARG TRELLIS2_MODEL_ID="microsoft/TRELLIS.2-4B"
 ARG TRELLIS2_REMBG_MODEL_ID="ZhengPeng7/BiRefNet"
 
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('${TRELLIS2_MODEL_ID}', repo_type='model')" \
+RUN --mount=type=secret,id=HF_TOKEN,required=false \
+    python -c "
+import os; token = open('/run/secrets/HF_TOKEN').read().strip() if os.path.exists('/run/secrets/HF_TOKEN') else None
+from huggingface_hub import snapshot_download; snapshot_download('${TRELLIS2_MODEL_ID}', repo_type='model', token=token)" \
     && echo "[pre-download] ${TRELLIS2_MODEL_ID} OK"
 
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('microsoft/TRELLIS-image-large', repo_type='model')" \
+RUN --mount=type=secret,id=HF_TOKEN,required=false \
+    python -c "
+import os; token = open('/run/secrets/HF_TOKEN').read().strip() if os.path.exists('/run/secrets/HF_TOKEN') else None
+from huggingface_hub import snapshot_download; snapshot_download('microsoft/TRELLIS-image-large', repo_type='model', token=token)" \
     && echo "[pre-download] microsoft/TRELLIS-image-large OK"
 
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('${TRELLIS2_REMBG_MODEL_ID}', repo_type='model')" \
+RUN --mount=type=secret,id=HF_TOKEN,required=false \
+    python -c "
+import os; token = open('/run/secrets/HF_TOKEN').read().strip() if os.path.exists('/run/secrets/HF_TOKEN') else None
+from huggingface_hub import snapshot_download; snapshot_download('${TRELLIS2_REMBG_MODEL_ID}', repo_type='model', token=token)" \
     && echo "[pre-download] ${TRELLIS2_REMBG_MODEL_ID} OK"
 
 # DINOv2 weights are fetched via torch.hub at runtime; pre-cache them now.

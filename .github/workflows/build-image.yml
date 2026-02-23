@@ -90,7 +90,11 @@ jobs:
           build-args: |
             BUILD_JOBS=1
             TORCH_CUDA_ARCH_LIST=8.9
+          secrets: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
           tags: ${{ steps.prep.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=registry,ref=kngsly/trellis2-worker:buildcache
+          cache-to: type=registry,ref=kngsly/trellis2-worker:buildcache,mode=max
