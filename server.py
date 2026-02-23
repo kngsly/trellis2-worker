@@ -88,6 +88,7 @@ from worker import (
     cancel_idle_shutdown,
     generate_glb_from_image_bytes_list,
     get_ready_state,
+    is_generating,
     normalize_generation_request,
     schedule_idle_shutdown_after_generation,
     start_preload_in_background,
@@ -133,7 +134,7 @@ def health():
 def ready():
     st = get_ready_state()
     ok = st.get("status") == "ready"
-    resp = {"ready": bool(ok), **st}
+    resp = {"ready": bool(ok), "generating": is_generating(), **st}
     return JSONResponse(resp, status_code=200)
 
 

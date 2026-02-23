@@ -269,36 +269,8 @@ RUN mkdir -p /tmp/extensions \
     && cp -r /opt/trellis2/src/o-voxel /tmp/extensions/o-voxel \
     && pip install /tmp/extensions/o-voxel --no-build-isolation
 
-# Reclaim disk from build-only source trees before downloading model weights.
+# Reclaim disk from build-only source trees.
 RUN rm -rf /tmp/extensions
-
-# Pre-download model weights into the image so startup doesn't spend 10+ min
-# fetching from HuggingFace Hub every time a fresh container launches.
-# Each download is its own layer so failures are isolated and buildx can push
-# completed layers before starting the next download.
-ARG TRELLIS2_MODEL_ID="microsoft/TRELLIS.2-4B"
-ARG TRELLIS2_REMBG_MODEL_ID="ZhengPeng7/BiRefNet"
-
-RUN --mount=type=secret,id=HF_TOKEN,required=false \
-    python -c "import os; token = open('/run/secrets/HF_TOKEN').read().strip() if os.path.exists('/run/secrets/HF_TOKEN') else None; from huggingface_hub import snapshot_download; snapshot_download('${TRELLIS2_MODEL_ID}', repo_type='model', token=token)" \
-    && echo "[pre-download] ${TRELLIS2_MODEL_ID} OK"
-
-RUN --mount=type=secret,id=HF_TOKEN,required=false \
-    python -c "import os; token = open('/run/secrets/HF_TOKEN').read().strip() if os.path.exists('/run/secrets/HF_TOKEN') else None; from huggingface_hub import snapshot_download; snapshot_download('microsoft/TRELLIS-image-large', repo_type='model', token=token)" \
-    && echo "[pre-download] microsoft/TRELLIS-image-large OK"
-
-RUN --mount=type=secret,id=HF_TOKEN,required=false \
-    python -c "import os; token = open('/run/secrets/HF_TOKEN').read().strip() if os.path.exists('/run/secrets/HF_TOKEN') else None; from huggingface_hub import snapshot_download; snapshot_download('${TRELLIS2_REMBG_MODEL_ID}', repo_type='model', token=token)" \
-    && echo "[pre-download] ${TRELLIS2_REMBG_MODEL_ID} OK"
-
-# DINOv2 weights are fetched via torch.hub at runtime; pre-cache them now.
-# Best-effort: model init may fail without a GPU, but the file download is
-# what matters for startup speed.
-RUN python -c "\
-import torch; \
-torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg', pretrained=True); \
-print('[pre-download] dinov2_vitl14_reg OK')" \
-    || echo "[pre-download] dinov2_vitl14_reg best-effort failed (expected without GPU)"
 
 COPY server.py /app/server.py
 COPY worker.py /app/worker.py

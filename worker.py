@@ -37,6 +37,15 @@ _READY = {
 _READY_LOCK = threading.Lock()
 _CUDA_RUNTIME_PREPARED = False
 
+_GENERATING_LOCK = threading.Lock()
+_GENERATING_COUNT = 0
+
+
+def is_generating() -> bool:
+    """True if at least one /generate call is currently in progress."""
+    with _GENERATING_LOCK:
+        return _GENERATING_COUNT > 0
+
 # Idle shutdown: if no generation after ready for N sec, or no new generation for N sec after last job, exit (backup so server does not idle forever).
 # Disabled by default; enable via TRELLIS2_IDLE_SHUTDOWN=1 or --idle-shutdown (see server.py).
 _IDLE_SHUTDOWN_TIMER: Optional[threading.Timer] = None
@@ -500,9 +509,10 @@ def _get_pipeline():
     _ensure_cuda_linker_paths()
 
     with _READY_LOCK:
-        if _READY["status"] == "not_started":
+        if _READY["status"] in ("not_started", "downloading"):
             _READY["status"] = "loading"
-            _READY["started_at"] = time.time()
+            if not _READY.get("started_at"):
+                _READY["started_at"] = time.time()
             _READY["detail"] = "initializing pipeline"
 
     model_id = os.environ.get("TRELLIS2_MODEL_ID", "microsoft/TRELLIS.2-4B")
@@ -604,17 +614,72 @@ def _on_ready_start_idle_timer() -> None:
     _log.info("idle shutdown: ready with no job; will exit in %s s if no generation", sec)
 
 
+def _warmup_gpu_kernels(pipe) -> None:
+    """
+    Run minimal dummy passes to pre-compile Triton/FlexGEMM kernels before the first real job.
+    Enabled by TRELLIS2_WARMUP=1 (default: off). Adds ~1–3 min to startup but eliminates
+    JIT overhead on the first generation.
+    """
+    import inspect
+    import torch
+
+    print("[worker] warmup: pre-compiling GPU kernels (TRELLIS2_WARMUP=1)...", flush=True)
+    t0 = time.time()
+    try:
+        dummy = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8) + 128, mode="RGB")
+
+        # 1. Warm up the image conditioning model (DINOv2 feature extractor).
+        try:
+            with torch.no_grad():
+                pipe.get_cond([dummy], 512)
+            print("[worker] warmup: image conditioning model OK", flush=True)
+        except Exception as e:
+            print(f"[worker] warmup: get_cond skipped ({e!r})", flush=True)
+
+        _cuda_empty_cache()
+
+        # 2. Run a single-step generation to trigger sparse attention / FlexGEMM compilation.
+        try:
+            sig = inspect.signature(pipe.run)
+            kw: dict = {"num_samples": 1, "preprocess_image": False, "seed": 0}
+            if "pipeline_type" in sig.parameters:
+                kw["pipeline_type"] = "512"
+            if "resolution" in sig.parameters:
+                kw["resolution"] = 512
+            for param, cfg in (
+                ("sparse_structure_sampler_params", {"steps": 1, "guidance_strength": 7.5, "guidance_rescale": 0.7, "rescale_t": 5.0}),
+                ("shape_slat_sampler_params", {"steps": 1, "guidance_strength": 7.5, "guidance_rescale": 0.5, "rescale_t": 3.0}),
+                ("tex_slat_sampler_params", {"steps": 1, "guidance_strength": 1.0, "guidance_rescale": 0.0, "rescale_t": 3.0}),
+            ):
+                if param in sig.parameters:
+                    kw[param] = cfg
+            with torch.no_grad():
+                pipe.run(dummy, **kw)
+            print("[worker] warmup: generation pass OK", flush=True)
+        except Exception as e:
+            print(f"[worker] warmup: generation pass skipped ({e!r})", flush=True)
+
+        _cuda_empty_cache()
+        dt = time.time() - t0
+        print(f"[worker] warmup: done in {dt:.1f}s", flush=True)
+    except Exception as e:
+        print(f"[worker] warmup: unexpected error ({e!r}), continuing", flush=True)
+        _cuda_empty_cache()
+
+
 def _preload_worker():
     try:
         _log.info("preload: starting model preload")
         print("[worker] preload: starting model preload", flush=True)
-        _get_pipeline()
+        pipe = _get_pipeline()
         st = get_ready_state()
         dt = 0.0
         if st.get("started_at") and st.get("ready_at"):
             dt = float(st["ready_at"]) - float(st["started_at"])
         _log.info("preload: ready (load_time_sec=%.1f)", dt)
         print(f"[worker] preload: ready (load_time_sec={dt:.1f})", flush=True)
+        if _bool_env("TRELLIS2_WARMUP", False):
+            _warmup_gpu_kernels(pipe)
         _on_ready_start_idle_timer()
     except Exception:
         tb = traceback.format_exc()
@@ -1187,6 +1252,10 @@ def generate_glb_from_image_bytes_list(
     if not images_bytes:
         raise ValueError("empty upload")
 
+    global _GENERATING_COUNT
+    with _GENERATING_LOCK:
+        _GENERATING_COUNT += 1
+
     _cuda_empty_cache()
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -1727,3 +1796,5 @@ def generate_glb_from_image_bytes_list(
         return out_path
     finally:
         _cuda_empty_cache()
+        with _GENERATING_LOCK:
+            _GENERATING_COUNT = max(0, _GENERATING_COUNT - 1)

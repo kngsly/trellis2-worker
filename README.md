@@ -44,16 +44,28 @@ Notes:
 - Runtime downloads are **enabled by default**: if a model asset is missing from the image cache it is downloaded at startup automatically.
 - Set `TRELLIS2_DISABLE_RUNTIME_DOWNLOADS=1` to opt out and force local-cache-only loading. Startup fails fast if any asset is missing — useful to catch a broken build early.
 
-### Model Asset Caching
+### Model Asset Caching (Persistent Volume — Recommended)
 
-The Docker build pre-downloads required model repos into the image layers. Runtime then resolves from local snapshots first, including cross-repo pipeline dependencies.
+The fastest startup is achieved by mounting a persistent volume for the HuggingFace cache. Models download once on first run and are reused on every subsequent start, regardless of which host the container lands on.
 
-If you still see Hugging Face `302/307` log lines at runtime, that means the container is not using local-only loading (or was built from an older image).
-
-Rebuild and run:
+On Vast.ai, attach a network volume mounted at `/root/.cache/huggingface` (or any path), then run:
 
 ```bash
-docker build --progress=plain --no-cache -t <dockerhub_user>/<image_name>:<tag> .
+docker run -d --name trellis2-worker --gpus all \
+  -v /path/to/persistent/volume:/root/.cache/huggingface \
+  -e PORT=8000 \
+  -e TRELLIS2_MODEL_ID="microsoft/TRELLIS.2-4B" \
+  -e HF_TOKEN="$HF_TOKEN" \
+  -e TRELLIS2_AVOID_GATED_DEPS=1 \
+  -p 8000:8000 \
+  <dockerhub_user>/<image_name>:<tag>
+```
+
+First run downloads models (~15 GB, ~5–8 min on a fast connection). Every subsequent start skips the download entirely and goes straight to model loading (~2–4 min).
+
+To force local-only loading and fail fast if any asset is missing (useful after the first successful run):
+
+```bash
 docker run ... -e TRELLIS2_DISABLE_RUNTIME_DOWNLOADS=1 ...
 ```
 
