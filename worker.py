@@ -934,7 +934,12 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
 
     if low_vram:
         try:
-            rembg_model.to(pipe.device)  # type: ignore[attr-defined]
+            target_dev = getattr(pipe, "device", "cuda")
+            inner = getattr(rembg_model, "model", None)
+            if inner is not None and hasattr(inner, "to"):
+                inner.to(target_dev)
+            else:
+                rembg_model.to(target_dev)  # type: ignore[attr-defined]
         except Exception as move_err:
             print(f"[worker] rembg: WARNING failed to move model to device: {move_err}", flush=True)
 
@@ -948,9 +953,22 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
                 flush=True,
             )
             try:
-                rembg_model.float()  # type: ignore[attr-defined]
+                # The BiRefNet wrapper may not expose .float() directly — try the inner model.
+                inner = getattr(rembg_model, "model", None)
+                if inner is not None and hasattr(inner, "float"):
+                    inner.float()
+                    print("[worker] rembg: forced inner model to float32", flush=True)
+                elif hasattr(rembg_model, "float"):
+                    rembg_model.float()  # type: ignore[attr-defined]
+                    print("[worker] rembg: forced wrapper to float32", flush=True)
+                else:
+                    print("[worker] rembg: WARNING no .float() available on model or wrapper", flush=True)
                 if low_vram:
-                    rembg_model.to(pipe.device)  # type: ignore[attr-defined]
+                    target_dev = getattr(pipe, "device", "cuda")
+                    if inner is not None and hasattr(inner, "to"):
+                        inner.to(target_dev)
+                    elif hasattr(rembg_model, "to"):
+                        rembg_model.to(target_dev)  # type: ignore[attr-defined]
                 out_rgba = rembg_model(im_rgb)  # type: ignore[attr-defined]
             except Exception as e2:
                 if _bool_env("TRELLIS2_PREPROCESS_DISABLE_REMBG_ON_ERROR", True):
@@ -974,7 +992,11 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
     finally:
         if low_vram:
             try:
-                rembg_model.cpu()  # type: ignore[attr-defined]
+                inner = getattr(rembg_model, "model", None)
+                if inner is not None and hasattr(inner, "to"):
+                    inner.cpu()
+                else:
+                    rembg_model.cpu()  # type: ignore[attr-defined]
             except Exception:
                 pass
 
