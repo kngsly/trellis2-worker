@@ -924,14 +924,21 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
     low_vram = bool(getattr(pipe, "low_vram", False))
     rembg_model = getattr(pipe, "rembg_model", None)
     if rembg_model is None:
+        print("[worker] rembg: WARNING rembg_model is None, skipping background removal", flush=True)
         return im_rgb.convert("RGBA")
+
+    print(
+        f"[worker] rembg: running BiRefNet on {im_rgb.size[0]}x{im_rgb.size[1]} image (low_vram={low_vram}, device={getattr(pipe, 'device', '?')})",
+        flush=True,
+    )
 
     if low_vram:
         try:
             rembg_model.to(pipe.device)  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        except Exception as move_err:
+            print(f"[worker] rembg: WARNING failed to move model to device: {move_err}", flush=True)
 
+    rembg_failed = False
     try:
         out_rgba = rembg_model(im_rgb)  # type: ignore[attr-defined]
     except Exception as e:
@@ -952,6 +959,7 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
                         flush=True,
                     )
                     out_rgba = im_rgb.convert("RGBA")
+                    rembg_failed = True
                 else:
                     raise
         elif _bool_env("TRELLIS2_PREPROCESS_DISABLE_REMBG_ON_ERROR", True):
@@ -960,6 +968,7 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
                 flush=True,
             )
             out_rgba = im_rgb.convert("RGBA")
+            rembg_failed = True
         else:
             raise
     finally:
@@ -968,6 +977,29 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
                 rembg_model.cpu()  # type: ignore[attr-defined]
             except Exception:
                 pass
+
+    # Verify output has meaningful transparency (background actually removed).
+    try:
+        out_arr = np.array(out_rgba)
+        if out_arr.ndim == 3 and out_arr.shape[2] >= 4:
+            alpha_ch = out_arr[:, :, 3]
+            opaque_frac = float((alpha_ch == 255).sum()) / float(max(1, alpha_ch.size))
+            transparent_frac = float((alpha_ch == 0).sum()) / float(max(1, alpha_ch.size))
+            print(
+                f"[worker] rembg: result mode={out_rgba.mode} size={out_rgba.size} "
+                f"alpha_stats: opaque={opaque_frac:.3f} transparent={transparent_frac:.3f} "
+                f"min={int(alpha_ch.min())} max={int(alpha_ch.max())} failed={rembg_failed}",
+                flush=True,
+            )
+            if not rembg_failed and opaque_frac > 0.99:
+                print(
+                    "[worker] rembg: WARNING output is >99% opaque — background removal may have failed silently!",
+                    flush=True,
+                )
+        else:
+            print(f"[worker] rembg: result mode={out_rgba.mode} size={out_rgba.size} (no alpha channel)", flush=True)
+    except Exception:
+        pass
 
     return out_rgba
 
@@ -1332,6 +1364,13 @@ def generate_glb_from_image_bytes_list(
             seed = _int_env("TRELLIS2_DEFAULT_SEED", 42)
 
         do_preprocess = _bool_env("TRELLIS2_PREPROCESS_IMAGE", True) if preprocess_image is None else bool(preprocess_image)
+        print(
+            f"[worker] preprocess decision: do_preprocess={do_preprocess} "
+            f"preprocess_image_arg={preprocess_image} "
+            f"num_images={len(imgs_raw)} "
+            f"img0_mode={img0_raw.mode} img0_size={img0_raw.size}",
+            flush=True,
+        )
 
         # Preprocess all input images and collect RGBA exports for background-removed versions.
         rembg_export_names: List[str] = []
