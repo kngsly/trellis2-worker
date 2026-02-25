@@ -972,13 +972,14 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
     return out_rgba
 
 
-def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
+def _safe_preprocess_image(pipe, input_im: Image.Image, return_rgba: bool = False):
     """
     Preprocess to match the official demo behavior, but with guardrails:
     - Avoid empty bbox when alpha is soft/low.
     - Optional padding around the alpha bbox.
 
     Returns an RGB PIL image (alpha premultiplied like upstream).
+    If return_rgba=True, returns (rgb_premultiplied, rgba_transparent) tuple.
     """
     max_size = max(input_im.size) if input_im.size else 0
     if max_size > 0:
@@ -1029,7 +1030,10 @@ def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
 
     out_np = np.array(out_rgba)
     if out_np.ndim != 3 or out_np.shape[2] < 4:
-        return out_rgba.convert("RGB")
+        rgb_result = out_rgba.convert("RGB")
+        if return_rgba:
+            return rgb_result, out_rgba.convert("RGBA")
+        return rgb_result
 
     alpha = out_np[:, :, 3]
     thresh = _float_env("TRELLIS2_PREPROCESS_ALPHA_BBOX_THRESHOLD", 0.8)
@@ -1039,7 +1043,10 @@ def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
         rgb = out_np[:, :, :3].astype(np.float32) / 255.0
         a = alpha.astype(np.float32)[:, :, None] / 255.0
         rgb = rgb * a
-        return Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
+        rgb_result = Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
+        if return_rgba:
+            return rgb_result, out_rgba
+        return rgb_result
 
     w, h = int(out_rgba.size[0]), int(out_rgba.size[1])
     crop_box = _crop_square_around_bbox(w=w, h=h, bbox_xyxy=bb, pad_px=pad_px)
@@ -1049,7 +1056,10 @@ def _safe_preprocess_image(pipe, input_im: Image.Image) -> Image.Image:
     rgb = cropped_np[:, :, :3]
     a = cropped_np[:, :, 3:4]
     rgb = rgb * a
-    return Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
+    rgb_result = Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
+    if return_rgba:
+        return rgb_result, cropped
+    return rgb_result
 
 
 # ---------------------------------------------------------------------------
@@ -1322,7 +1332,28 @@ def generate_glb_from_image_bytes_list(
             seed = _int_env("TRELLIS2_DEFAULT_SEED", 42)
 
         do_preprocess = _bool_env("TRELLIS2_PREPROCESS_IMAGE", True) if preprocess_image is None else bool(preprocess_image)
-        primary_img = _safe_preprocess_image(pipe, img0_raw) if do_preprocess else _prepare_input_image(img0_raw).convert("RGB")
+
+        # Preprocess all input images and collect RGBA exports for background-removed versions.
+        rembg_export_names: List[str] = []
+        uid = uuid.uuid4().hex
+        if do_preprocess:
+            result = _safe_preprocess_image(pipe, img0_raw, return_rgba=True)
+            primary_img, primary_rgba = result
+            # Save RGBA for all input images.
+            for rembg_idx, rembg_im_raw in enumerate(imgs_raw):
+                try:
+                    if rembg_idx == 0:
+                        rgba_out = primary_rgba
+                    else:
+                        _, rgba_out = _safe_preprocess_image(pipe, rembg_im_raw, return_rgba=True)
+                    fname = f"{uid}_rembg_{rembg_idx:02d}.png"
+                    rgba_out.save(str(out_dir / fname), format="PNG")
+                    rembg_export_names.append(fname)
+                    print(f"[worker] saved rembg export: {fname} ({rgba_out.size[0]}x{rgba_out.size[1]})", flush=True)
+                except Exception as e:
+                    print(f"[worker] WARNING: failed to save rembg export for image {rembg_idx}: {e}", flush=True)
+        else:
+            primary_img = _prepare_input_image(img0_raw).convert("RGB")
         fallback_img = _prepare_input_image(img0_raw).convert("RGB") if do_preprocess else None
 
         # Pass only kwargs supported by this pipeline version.
@@ -1647,7 +1678,6 @@ def generate_glb_from_image_bytes_list(
         )
         texture_size = int(normalized_request["texture_output_size"])
         decimation_initial = int(decimation_target)
-        uid = uuid.uuid4().hex
         dec_min = _int_env("TRELLIS2_DECIMATION_MIN_OOM_FALLBACK", 15000)
         glb = None
         last_glb_err = None
@@ -1666,6 +1696,7 @@ def generate_glb_from_image_bytes_list(
                 "input_image_count": len(images_bytes),
                 "oom_quality_degradation_level": oom_quality_level,
                 "enable_hd": bool(normalized_request["enable_hd"]),
+                "preprocessed_images": rembg_export_names if rembg_export_names else None,
             })
             if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs.get("sparse_structure_sampler_params"), dict):
                 export_meta["sparse_structure_steps"] = kwargs["sparse_structure_sampler_params"].get("steps")
