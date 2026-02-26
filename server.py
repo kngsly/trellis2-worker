@@ -199,6 +199,7 @@ async def generate(
     texture_generation_mode: Optional[str] = Form(None),
     texture_output_size: Optional[str] = Form(None),
     steps: Optional[str] = Form(None),
+    generate_timeout_sec: Optional[str] = Form(None),
     # Legacy aliases retained for compatibility.
     resolution: Optional[str] = Form(None),
     texture_mode: Optional[str] = Form(None),
@@ -266,28 +267,43 @@ async def generate(
 
         cancel_idle_shutdown()
 
+        # Server-side generation timeout.
+        # The client can pass generate_timeout_sec; fall back to generous defaults.
+        timeout_sec = _parse_int(generate_timeout_sec, default=None)
+        if timeout_sec is None or timeout_sec <= 0:
+            is_standard = normalized["mesh_profile"] == "game_ready"
+            timeout_sec = 10 * 60 if is_standard else 20 * 60
+        timeout_sec = max(30, min(timeout_sec, 30 * 60))  # clamp 30s–30min
+        _log.info("generate timeout_sec=%s", timeout_sec)
+
         # Run the blocking CUDA generation in a thread so the event loop stays
         # responsive for /health and /ready probes during long jobs.
-        out_path = await asyncio.to_thread(
-            partial(
-                generate_glb_from_image_bytes_list,
-                raw_list,
-                out_dir=OUTPUT_DIR,
-                low_poly=bool(normalized["mesh_profile"] == "game_ready"),
-                seed=safe_seed,
-                pipeline_type=normalized["pipeline_type"],
-                preprocess_image=want_preprocess,
-                post_scale_z=want_post_scale_z,
-                backup_inputs=want_backup,
-                export_meta=export_meta,
-                decimation_target=normalized["decimation_target"],
-                mesh_profile=normalized["mesh_profile"],
-                geometry_resolution=normalized["geometry_resolution"],
-                texture_generation_mode=normalized["texture_generation_mode"],
-                texture_output_size=normalized["texture_output_size"],
-                steps=normalized["steps"],
+        try:
+            out_path = await asyncio.wait_for(
+                asyncio.to_thread(
+                    partial(
+                        generate_glb_from_image_bytes_list,
+                        raw_list,
+                        out_dir=OUTPUT_DIR,
+                        low_poly=bool(normalized["mesh_profile"] == "game_ready"),
+                        seed=safe_seed,
+                        pipeline_type=normalized["pipeline_type"],
+                        preprocess_image=want_preprocess,
+                        post_scale_z=want_post_scale_z,
+                        backup_inputs=want_backup,
+                        export_meta=export_meta,
+                        decimation_target=normalized["decimation_target"],
+                        mesh_profile=normalized["mesh_profile"],
+                        geometry_resolution=normalized["geometry_resolution"],
+                        texture_generation_mode=normalized["texture_generation_mode"],
+                        texture_output_size=normalized["texture_output_size"],
+                        steps=normalized["steps"],
+                    )
+                ),
+                timeout=timeout_sec,
             )
-        )
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Generation timed out after {timeout_sec}s")
         schedule_idle_shutdown_after_generation()
         resp = {"success": True, "glb_path": str(out_path)}
         if export_meta:
