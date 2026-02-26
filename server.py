@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import json
 import logging
 import os
 import sys
+import time
 import traceback
 from contextlib import asynccontextmanager
 from functools import partial
@@ -81,8 +83,8 @@ def _apply_server_args():
 
 _apply_server_args()
 
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, Request, UploadFile, Form
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from worker import (
     cancel_idle_shutdown,
@@ -185,6 +187,7 @@ def _parse_int(v: Optional[str], default: Optional[int] = None) -> Optional[int]
 
 @app.post("/generate")
 async def generate(
+    request: Request,
     image: Optional[UploadFile] = File(None),
     images: Optional[List[UploadFile]] = File(None),
     low_poly: Optional[str] = Form(None),
@@ -278,37 +281,109 @@ async def generate(
 
         # Run the blocking CUDA generation in a thread so the event loop stays
         # responsive for /health and /ready probes during long jobs.
-        try:
-            out_path = await asyncio.wait_for(
+        # Stream NDJSON keepalive pings every 15s to prevent idle TCP timeouts.
+        KEEPALIVE_INTERVAL = 15
+
+        gen_kwargs = dict(
+            out_dir=OUTPUT_DIR,
+            low_poly=bool(normalized["mesh_profile"] == "game_ready"),
+            seed=safe_seed,
+            pipeline_type=normalized["pipeline_type"],
+            preprocess_image=want_preprocess,
+            post_scale_z=want_post_scale_z,
+            backup_inputs=want_backup,
+            export_meta=export_meta,
+            decimation_target=normalized["decimation_target"],
+            mesh_profile=normalized["mesh_profile"],
+            geometry_resolution=normalized["geometry_resolution"],
+            texture_generation_mode=normalized["texture_generation_mode"],
+            texture_output_size=normalized["texture_output_size"],
+            steps=normalized["steps"],
+        )
+
+        async def _stream():
+            start = time.monotonic()
+            gen_task = asyncio.ensure_future(
                 asyncio.to_thread(
-                    partial(
-                        generate_glb_from_image_bytes_list,
-                        raw_list,
-                        out_dir=OUTPUT_DIR,
-                        low_poly=bool(normalized["mesh_profile"] == "game_ready"),
-                        seed=safe_seed,
-                        pipeline_type=normalized["pipeline_type"],
-                        preprocess_image=want_preprocess,
-                        post_scale_z=want_post_scale_z,
-                        backup_inputs=want_backup,
-                        export_meta=export_meta,
-                        decimation_target=normalized["decimation_target"],
-                        mesh_profile=normalized["mesh_profile"],
-                        geometry_resolution=normalized["geometry_resolution"],
-                        texture_generation_mode=normalized["texture_generation_mode"],
-                        texture_output_size=normalized["texture_output_size"],
-                        steps=normalized["steps"],
-                    )
-                ),
-                timeout=timeout_sec,
+                    partial(generate_glb_from_image_bytes_list, raw_list, **gen_kwargs)
+                )
             )
-        except asyncio.TimeoutError:
-            raise TimeoutError(f"Generation timed out after {timeout_sec}s")
-        schedule_idle_shutdown_after_generation()
-        resp = {"success": True, "glb_path": str(out_path)}
-        if export_meta:
-            resp["worker_export"] = export_meta
-        return JSONResponse(resp, status_code=200)
+            try:
+                while not gen_task.done():
+                    # Check for client disconnect
+                    if await request.is_disconnected():
+                        elapsed = time.monotonic() - start
+                        _log.warning(
+                            "client disconnected during generation at %.1fs", elapsed
+                        )
+                        gen_task.cancel()
+                        return
+
+                    done, _ = await asyncio.wait({gen_task}, timeout=KEEPALIVE_INTERVAL)
+                    if done:
+                        break
+
+                    elapsed = time.monotonic() - start
+                    if elapsed > timeout_sec:
+                        gen_task.cancel()
+                        _log.warning("generation timed out after %ss", timeout_sec)
+                        resp = {
+                            "type": "result",
+                            "success": False,
+                            "error": f"Generation timed out after {timeout_sec}s",
+                        }
+                        if export_meta:
+                            resp["worker_export"] = export_meta
+                        yield json.dumps(resp) + "\n"
+                        return
+                    yield json.dumps(
+                        {"type": "keepalive", "elapsed_sec": round(elapsed, 1)}
+                    ) + "\n"
+
+                elapsed = time.monotonic() - start
+                client_connected = not await request.is_disconnected()
+                _log.info(
+                    "generation wall_time=%.1fs client_connected=%s",
+                    elapsed,
+                    client_connected,
+                )
+
+                out_path = gen_task.result()
+                resp = {
+                    "type": "result",
+                    "success": True,
+                    "glb_path": str(out_path),
+                }
+                if export_meta:
+                    resp["worker_export"] = export_meta
+                yield json.dumps(resp) + "\n"
+            except asyncio.CancelledError:
+                elapsed = time.monotonic() - start
+                _log.warning("generation cancelled at %.1fs", elapsed)
+                resp = {
+                    "type": "result",
+                    "success": False,
+                    "error": "Generation cancelled (client disconnected)",
+                }
+                if export_meta:
+                    resp["worker_export"] = export_meta
+                yield json.dumps(resp) + "\n"
+            except Exception:
+                tb = traceback.format_exc()
+                if len(tb) > 20000:
+                    tb = tb[:20000] + "\n...[truncated]...\n"
+                resp = {"type": "result", "success": False, "error": tb}
+                if export_meta:
+                    resp["worker_export"] = export_meta
+                yield json.dumps(resp) + "\n"
+            finally:
+                schedule_idle_shutdown_after_generation()
+
+        return StreamingResponse(
+            _stream(),
+            status_code=200,
+            media_type="application/x-ndjson",
+        )
     except Exception:
         schedule_idle_shutdown_after_generation()
         tb = traceback.format_exc()
