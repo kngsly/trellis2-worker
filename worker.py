@@ -19,6 +19,7 @@ import time
 import traceback
 import uuid
 import ctypes
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -1026,14 +1027,255 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
     return out_rgba
 
 
-def _safe_preprocess_image(pipe, input_im: Image.Image, return_rgba: bool = False):
+# ---------------------------------------------------------------------------
+# Alpha quality assessment & adaptive step-up
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AlphaQualityReport:
+    level: int
+    score: float              # 0.0 (terrible) to 1.0 (perfect)
+    passed: bool
+    bg_white_residue_pct: float
+    fg_white_residue_pct: float   # opaque white pixels likely trapped background
+    shadow_residue_pct: float
+    foreground_coverage_pct: float
+    semi_transparent_pct: float
+    edge_halo_pct: float
+    opaque_pct: float
+    transparent_pct: float
+    detail: str
+
+
+def _assess_alpha_quality(
+    rgba: Image.Image,
+    original_rgb: np.ndarray,
+    level: int,
+) -> AlphaQualityReport:
     """
-    Preprocess to match the official demo behavior, but with guardrails:
-    - Avoid empty bbox when alpha is soft/low.
-    - Optional padding around the alpha bbox.
+    Pure analysis: evaluate how clean the background removal is.
+    Returns an AlphaQualityReport with per-defect metrics and overall score.
+    """
+    bg_alpha_thresh = _int_env("TRELLIS2_QA_BG_ALPHA_THRESH", 25)
+    white_luma_min = _int_env("TRELLIS2_QA_WHITE_LUMA_MIN", 200)
+    white_chroma_max = _int_env("TRELLIS2_QA_WHITE_CHROMA_MAX", 40)
+    shadow_luma_max = _int_env("TRELLIS2_QA_SHADOW_LUMA_MAX", 120)
+    edge_erode_px = _int_env("TRELLIS2_QA_EDGE_ERODE_PX", 3)
+    pass_threshold = _float_env("TRELLIS2_QA_PASS_THRESHOLD", 0.70)
+
+    arr = np.array(rgba)
+    if arr.ndim != 3 or arr.shape[2] < 4:
+        return AlphaQualityReport(
+            level=level, score=1.0, passed=True,
+            bg_white_residue_pct=0, fg_white_residue_pct=0,
+            shadow_residue_pct=0,
+            foreground_coverage_pct=100, semi_transparent_pct=0,
+            edge_halo_pct=0, opaque_pct=100, transparent_pct=0,
+            detail="no alpha channel",
+        )
+
+    rgb = arr[:, :, :3].astype(np.float32)
+    alpha = arr[:, :, 3]
+    total_px = max(1, alpha.size)
+
+    # Luminance & chroma from RGB
+    luma = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+    chroma = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+
+    # Basic alpha stats
+    opaque_mask = alpha > 200
+    transparent_mask = alpha < bg_alpha_thresh
+    semi_mask = (alpha >= 1) & (alpha <= 254)
+    opaque_pct = 100.0 * float(opaque_mask.sum()) / total_px
+    transparent_pct = 100.0 * float(transparent_mask.sum()) / total_px
+    semi_transparent_pct = 100.0 * float(semi_mask.sum()) / total_px
+
+    # 1) Background white residue: bg pixels with white-ish RGB
+    bg_mask = alpha < bg_alpha_thresh
+    bg_count = max(1, int(bg_mask.sum()))
+    white_in_bg = bg_mask & (luma > white_luma_min) & (chroma < white_chroma_max)
+    bg_white_residue_pct = 100.0 * float(white_in_bg.sum()) / total_px
+
+    # 1b) Foreground white residue: opaque pixels that look like trapped background
+    #     (bright, achromatic — likely white bg that flood-fill couldn't reach)
+    fg_white = opaque_mask & (luma > white_luma_min) & (chroma < white_chroma_max)
+    fg_white_residue_pct = 100.0 * float(fg_white.sum()) / total_px
+
+    # 2) Foreground coverage
+    foreground_coverage_pct = opaque_pct
+
+    # 3) Shadow residue: erode foreground, find edge band, check for dark semi-transparent
+    import cv2  # type: ignore
+    fg_binary = (alpha > bg_alpha_thresh).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (edge_erode_px * 2 + 1, edge_erode_px * 2 + 1))
+    eroded = cv2.erode(fg_binary, kernel, iterations=1)
+    edge_band = (fg_binary > 0) & (eroded == 0)
+    edge_count = max(1, int(edge_band.sum()))
+    shadow_in_edge = edge_band & (luma < shadow_luma_max) & (alpha > 10) & (alpha < 200)
+    shadow_residue_pct = 100.0 * float(shadow_in_edge.sum()) / total_px
+
+    # 4) Edge halo: semi-transparent pixels with high luminance and low chroma (light fringes)
+    halo_mask = semi_mask & (luma > 180) & (chroma < white_chroma_max)
+    edge_halo_pct = 100.0 * float(halo_mask.sum()) / total_px
+
+    # 5) Overall score: start at 1.0, penalize each defect
+    score = 1.0
+    score -= bg_white_residue_pct * 0.03   # white bg residue is a strong signal
+    score -= shadow_residue_pct * 0.02
+    score -= edge_halo_pct * 0.025
+    # Penalize opaque white pixels trapped in foreground (likely un-removed background).
+    # Use a threshold so tiny amounts (subject highlights, etc.) don't trigger.
+    fg_white_thresh = _float_env("TRELLIS2_QA_FG_WHITE_THRESH_PCT", 10.0)
+    if fg_white_residue_pct > fg_white_thresh:
+        score -= (fg_white_residue_pct - fg_white_thresh) * 0.02
+    # Penalize if too much or too little foreground
+    if foreground_coverage_pct > 90.0:
+        score -= (foreground_coverage_pct - 90.0) * 0.05
+    if foreground_coverage_pct < 5.0:
+        score -= (5.0 - foreground_coverage_pct) * 0.05
+    # Penalize excessive semi-transparency (but some is natural)
+    if semi_transparent_pct > 10.0:
+        score -= (semi_transparent_pct - 10.0) * 0.01
+
+    score = max(0.0, min(1.0, score))
+    passed = score >= pass_threshold
+
+    details = []
+    if bg_white_residue_pct > 1.0:
+        details.append(f"white_bg={bg_white_residue_pct:.1f}%")
+    if fg_white_residue_pct > 5.0:
+        details.append(f"fg_white={fg_white_residue_pct:.1f}%")
+    if shadow_residue_pct > 0.5:
+        details.append(f"shadow={shadow_residue_pct:.1f}%")
+    if edge_halo_pct > 1.0:
+        details.append(f"halo={edge_halo_pct:.1f}%")
+    if foreground_coverage_pct > 90.0:
+        details.append(f"fg_too_high={foreground_coverage_pct:.1f}%")
+
+    return AlphaQualityReport(
+        level=level,
+        score=round(score, 3),
+        passed=passed,
+        bg_white_residue_pct=round(bg_white_residue_pct, 2),
+        fg_white_residue_pct=round(fg_white_residue_pct, 2),
+        shadow_residue_pct=round(shadow_residue_pct, 2),
+        foreground_coverage_pct=round(foreground_coverage_pct, 2),
+        semi_transparent_pct=round(semi_transparent_pct, 2),
+        edge_halo_pct=round(edge_halo_pct, 2),
+        opaque_pct=round(opaque_pct, 2),
+        transparent_pct=round(transparent_pct, 2),
+        detail="; ".join(details) if details else "clean",
+    )
+
+
+def _postprocess_alpha(rgba: Image.Image, level: int) -> Image.Image:
+    """
+    Apply progressively stronger alpha cleanup.
+    Level 2: hard-threshold + erosion.
+    Level 3: level 2 + shadow/halo removal + morphological close.
+    Returns a new RGBA image.
+    """
+    if level < 2:
+        return rgba
+
+    import cv2  # type: ignore
+
+    arr = np.array(rgba).copy()
+    if arr.ndim != 3 or arr.shape[2] < 4:
+        return rgba
+
+    alpha = arr[:, :, 3]
+    rgb = arr[:, :, :3].astype(np.float32)
+    luma = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+    chroma = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+
+    white_chroma_max = _int_env("TRELLIS2_QA_WHITE_CHROMA_MAX", 40)
+    shadow_luma_max = _int_env("TRELLIS2_QA_SHADOW_LUMA_MAX", 120)
+    edge_erode_px = _int_env("TRELLIS2_QA_EDGE_ERODE_PX", 3)
+
+    # Level 2: hard threshold + erosion
+    alpha = np.where(alpha < 128, np.uint8(0), np.uint8(255))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    alpha = cv2.erode(alpha, kernel, iterations=1)
+
+    if level >= 3:
+        # Build edge band from the hard-thresholded alpha
+        fg_binary = (alpha > 0).astype(np.uint8) * 255
+        edge_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (edge_erode_px * 2 + 1, edge_erode_px * 2 + 1)
+        )
+        eroded_fg = cv2.erode(fg_binary, edge_kernel, iterations=1)
+        edge_band = (fg_binary > 0) & (eroded_fg == 0)
+
+        # Shadow removal: zero alpha on dark semi-transparent edge pixels
+        shadow_mask = edge_band & (luma < shadow_luma_max) & (chroma < white_chroma_max)
+        alpha[shadow_mask] = 0
+
+        # Halo removal: zero alpha on bright, achromatic near-edge pixels
+        halo_mask = edge_band & (luma > 180) & (chroma < white_chroma_max)
+        alpha[halo_mask] = 0
+
+        # Morphological close to clean small holes
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    arr[:, :, 3] = alpha
+    return Image.fromarray(arr)
+
+
+def _check_foreground_preserved(
+    original_rgba: Image.Image, processed_rgba: Image.Image
+) -> bool:
+    """
+    Safety guard: reject post-processing if too many foreground pixels were removed.
+    Returns True if the result is acceptable (foreground preserved).
+    """
+    max_loss_pct = _float_env("TRELLIS2_QA_MAX_FG_LOSS_PCT", 15.0)
+
+    orig_arr = np.array(original_rgba)
+    proc_arr = np.array(processed_rgba)
+    orig_alpha = orig_arr[:, :, 3] if orig_arr.ndim == 3 and orig_arr.shape[2] >= 4 else None
+    proc_alpha = proc_arr[:, :, 3] if proc_arr.ndim == 3 and proc_arr.shape[2] >= 4 else None
+
+    if orig_alpha is None or proc_alpha is None:
+        return True
+
+    orig_fg = int((orig_alpha > 128).sum())
+    proc_fg = int((proc_alpha > 128).sum())
+
+    if orig_fg == 0:
+        return True
+
+    loss_pct = 100.0 * (orig_fg - proc_fg) / orig_fg
+    if loss_pct > max_loss_pct:
+        print(
+            f"[worker] preprocess: foreground preservation check FAILED: "
+            f"lost {loss_pct:.1f}% of foreground pixels (max={max_loss_pct}%)",
+            flush=True,
+        )
+        return False
+    return True
+
+
+def _safe_preprocess_image(
+    pipe,
+    input_im: Image.Image,
+    return_rgba: bool = False,
+    out_dir: Optional[Path] = None,
+    uid: Optional[str] = None,
+):
+    """
+    Preprocess to match the official demo behavior, with adaptive quality
+    checking and step-up system for background removal.
+
+    Levels:
+      0 — Use input alpha as-is (if client sent alpha)
+      1 — Run BiRefNet (standard background removal)
+      2 — Reuse BiRefNet result + moderate post-processing
+      3 — Reuse BiRefNet result + aggressive post-processing
 
     Returns an RGB PIL image (alpha premultiplied like upstream).
-    If return_rgba=True, returns (rgb_premultiplied, rgba_transparent) tuple.
+    If return_rgba=True, returns (rgb_premultiplied, rgba_transparent, qa_report) tuple.
     """
     max_size = max(input_im.size) if input_im.size else 0
     if max_size > 0:
@@ -1044,6 +1286,10 @@ def _safe_preprocess_image(pipe, input_im: Image.Image, return_rgba: bool = Fals
                 Image.Resampling.LANCZOS,
             )
 
+    qa_enabled = _bool_env("TRELLIS2_QA_ENABLE", True)
+    max_level = _int_env("TRELLIS2_QA_MAX_LEVEL", 3)
+    save_debug = _bool_env("TRELLIS2_QA_SAVE_DEBUG", False)
+
     has_alpha = False
     try:
         if input_im.mode == "RGBA":
@@ -1053,40 +1299,162 @@ def _safe_preprocess_image(pipe, input_im: Image.Image, return_rgba: bool = Fals
     except Exception:
         has_alpha = False
 
-    if not has_alpha:
-        im_rgb = input_im.convert("RGB")
-        out_rgba = _run_rembg_rgba(pipe, im_rgb)
-    else:
-        out_rgba = input_im.convert("RGBA")
-        # Guardrail: broken/near-empty alpha mattes can cause full-frame box crops.
-        # If alpha looks unusable, optionally re-run rembg on RGB.
-        if _bool_env("TRELLIS2_PREPROCESS_REMBG_ON_BAD_ALPHA", True):
-            alpha_probe = np.array(out_rgba)[:, :, 3]
-            probe_thresh = _float_env("TRELLIS2_PREPROCESS_ALPHA_BBOX_THRESHOLD", 0.8)
-            bb_probe = _safe_alpha_bbox(alpha_probe, primary_thresh=probe_thresh)
-            bad_alpha = bb_probe is None
-            if not bad_alpha:
-                w_probe, h_probe = out_rgba.size
-                x0, y0, x1, y1 = bb_probe
-                bb_area = max(1, (int(x1) - int(x0) + 1) * (int(y1) - int(y0) + 1))
-                cover = float(bb_area) / float(max(1, w_probe * h_probe))
-                strong_cover = float((alpha_probe > int(0.8 * 255.0)).mean())
-                max_cover = _float_env("TRELLIS2_PREPROCESS_BAD_ALPHA_MAX_BBOX_COVER", 0.98)
-                min_strong = _float_env("TRELLIS2_PREPROCESS_BAD_ALPHA_MIN_STRONG_COVER", 0.70)
-                if cover >= max_cover and strong_cover < min_strong:
-                    bad_alpha = True
-            if bad_alpha:
+    original_rgb = np.array(input_im.convert("RGB"))
+
+    # -- Adaptive quality loop --
+    birefnet_rgba: Optional[Image.Image] = None  # cached BiRefNet result
+    best_rgba: Optional[Image.Image] = None
+    best_report: Optional[AlphaQualityReport] = None
+    level_scores: List[str] = []
+
+    start_level = 0 if has_alpha else 1
+    end_level = max_level if qa_enabled else (1 if not has_alpha else 0)
+
+    for level in range(start_level, end_level + 1):
+        t_level = time.time()
+
+        if level == 0:
+            # Use input alpha as-is
+            candidate_rgba = input_im.convert("RGBA")
+            # Guardrail: broken/near-empty alpha mattes can cause full-frame box crops.
+            if _bool_env("TRELLIS2_PREPROCESS_REMBG_ON_BAD_ALPHA", True):
+                alpha_probe = np.array(candidate_rgba)[:, :, 3]
+                probe_thresh = _float_env("TRELLIS2_PREPROCESS_ALPHA_BBOX_THRESHOLD", 0.8)
+                bb_probe = _safe_alpha_bbox(alpha_probe, primary_thresh=probe_thresh)
+                bad_alpha = bb_probe is None
+                if not bad_alpha:
+                    w_probe, h_probe = candidate_rgba.size
+                    x0, y0, x1, y1 = bb_probe
+                    bb_area = max(1, (int(x1) - int(x0) + 1) * (int(y1) - int(y0) + 1))
+                    cover = float(bb_area) / float(max(1, w_probe * h_probe))
+                    strong_cover = float((alpha_probe > int(0.8 * 255.0)).mean())
+                    max_cover = _float_env("TRELLIS2_PREPROCESS_BAD_ALPHA_MAX_BBOX_COVER", 0.98)
+                    min_strong = _float_env("TRELLIS2_PREPROCESS_BAD_ALPHA_MIN_STRONG_COVER", 0.70)
+                    if cover >= max_cover and strong_cover < min_strong:
+                        bad_alpha = True
+                if bad_alpha:
+                    print(
+                        "[worker] preprocess: level 0 alpha matte looks unreliable; skipping to level 1",
+                        flush=True,
+                    )
+                    continue
+
+        elif level == 1:
+            # Run BiRefNet (standard)
+            im_rgb = input_im.convert("RGB")
+            birefnet_rgba = _run_rembg_rgba(pipe, im_rgb)
+            candidate_rgba = birefnet_rgba
+
+        elif level >= 2:
+            # Post-process the BiRefNet result (levels 2 and 3)
+            if birefnet_rgba is None:
+                # BiRefNet hasn't run yet (e.g. started at level 0 and skipped level 1)
+                im_rgb = input_im.convert("RGB")
+                birefnet_rgba = _run_rembg_rgba(pipe, im_rgb)
+            candidate_rgba = _postprocess_alpha(birefnet_rgba, level)
+            # Safety: check foreground preservation
+            if not _check_foreground_preserved(birefnet_rgba, candidate_rgba):
                 print(
-                    "[worker] preprocess: alpha matte looks unreliable; retrying with rembg segmentation",
+                    f"[worker] preprocess: level {level} rejected (foreground clipped), keeping previous best",
                     flush=True,
                 )
-                out_rgba = _run_rembg_rgba(pipe, input_im.convert("RGB"))
+                continue
 
+        dt = time.time() - t_level
+
+        # Save debug export if enabled
+        if save_debug and out_dir is not None and uid is not None:
+            try:
+                debug_name = f"{uid}_qa_level{level}.png"
+                candidate_rgba.save(str(out_dir / debug_name), format="PNG")
+            except Exception:
+                pass
+
+        if not qa_enabled:
+            # QA disabled — use this result directly
+            best_rgba = candidate_rgba
+            best_report = AlphaQualityReport(
+                level=level, score=1.0, passed=True,
+                bg_white_residue_pct=0, fg_white_residue_pct=0,
+                shadow_residue_pct=0,
+                foreground_coverage_pct=0, semi_transparent_pct=0,
+                edge_halo_pct=0, opaque_pct=0, transparent_pct=0,
+                detail="qa_disabled",
+            )
+            break
+
+        # Assess quality
+        report = _assess_alpha_quality(candidate_rgba, original_rgb, level)
+        level_scores.append(f"L{level}:{report.score:.2f}")
+
+        print(
+            f"[worker] preprocess: level {level} QA: score={report.score:.3f} passed={report.passed} "
+            f"bg_white_residue={report.bg_white_residue_pct:.1f}% "
+            f"fg_white_residue={report.fg_white_residue_pct:.1f}% "
+            f"shadow_residue={report.shadow_residue_pct:.1f}% "
+            f"foreground_coverage={report.foreground_coverage_pct:.1f}% "
+            f"semi_transparent={report.semi_transparent_pct:.1f}% "
+            f"edge_halo={report.edge_halo_pct:.1f}% dt={dt:.2f}s",
+            flush=True,
+        )
+
+        # Track best result
+        if best_report is None or report.score > best_report.score:
+            best_rgba = candidate_rgba
+            best_report = report
+
+        if report.passed:
+            if level >= 1:
+                print(
+                    f"[worker] preprocess: level {level} PASSED (score={report.score:.3f})",
+                    flush=True,
+                )
+                break
+            else:
+                # Level 0 (input alpha): always try BiRefNet too so we can compare.
+                # Input alpha from client-side flood-fill may have trapped white regions
+                # that BiRefNet (neural segmentation) handles better.
+                print(
+                    f"[worker] preprocess: level {level} scored {report.score:.3f}, "
+                    f"continuing to BiRefNet for comparison",
+                    flush=True,
+                )
+        else:
+            if level < end_level:
+                print(
+                    f"[worker] preprocess: level {level} FAILED (score={report.score:.3f}), stepping up to level {level + 1}",
+                    flush=True,
+                )
+
+    # QA summary
+    if qa_enabled and level_scores:
+        final_level = best_report.level if best_report else -1
+        final_score = best_report.score if best_report else 0.0
+        print(
+            f"[worker] preprocess: QA summary: {' | '.join(level_scores)} → using level {final_level} (score={final_score:.3f})",
+            flush=True,
+        )
+
+    # Fallback: if nothing was set (shouldn't happen), use input as-is
+    if best_rgba is None:
+        best_rgba = input_im.convert("RGBA")
+        best_report = AlphaQualityReport(
+            level=-1, score=0.0, passed=False,
+            bg_white_residue_pct=0, fg_white_residue_pct=0,
+            shadow_residue_pct=0,
+            foreground_coverage_pct=0, semi_transparent_pct=0,
+            edge_halo_pct=0, opaque_pct=0, transparent_pct=0,
+            detail="fallback",
+        )
+
+    out_rgba = best_rgba
+
+    # -- Existing bbox detection, cropping, alpha premultiply --
     out_np = np.array(out_rgba)
     if out_np.ndim != 3 or out_np.shape[2] < 4:
         rgb_result = out_rgba.convert("RGB")
         if return_rgba:
-            return rgb_result, out_rgba.convert("RGBA")
+            return rgb_result, out_rgba.convert("RGBA"), best_report
         return rgb_result
 
     alpha = out_np[:, :, 3]
@@ -1099,7 +1467,7 @@ def _safe_preprocess_image(pipe, input_im: Image.Image, return_rgba: bool = Fals
         rgb = rgb * a
         rgb_result = Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
         if return_rgba:
-            return rgb_result, out_rgba
+            return rgb_result, out_rgba, best_report
         return rgb_result
 
     w, h = int(out_rgba.size[0]), int(out_rgba.size[1])
@@ -1112,7 +1480,7 @@ def _safe_preprocess_image(pipe, input_im: Image.Image, return_rgba: bool = Fals
     rgb = rgb * a
     rgb_result = Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
     if return_rgba:
-        return rgb_result, cropped
+        return rgb_result, cropped, best_report
     return rgb_result
 
 
@@ -1397,16 +1765,31 @@ def generate_glb_from_image_bytes_list(
         # Preprocess all input images and collect RGBA exports for background-removed versions.
         rembg_export_names: List[str] = []
         uid = uuid.uuid4().hex
+        primary_qa_report: Optional[AlphaQualityReport] = None
         if do_preprocess:
-            result = _safe_preprocess_image(pipe, img0_raw, return_rgba=True)
-            primary_img, primary_rgba = result
+            result = _safe_preprocess_image(pipe, img0_raw, return_rgba=True, out_dir=out_dir, uid=uid)
+            primary_img, primary_rgba, primary_qa_report = result
+            # Add QA metrics to export_meta
+            if export_meta is not None and primary_qa_report is not None:
+                export_meta.update({
+                    "bg_removal_final_level": primary_qa_report.level,
+                    "bg_removal_final_score": primary_qa_report.score,
+                    "bg_removal_passed": primary_qa_report.passed,
+                    "bg_removal_bg_white_residue_pct": primary_qa_report.bg_white_residue_pct,
+                    "bg_removal_fg_white_residue_pct": primary_qa_report.fg_white_residue_pct,
+                    "bg_removal_shadow_residue_pct": primary_qa_report.shadow_residue_pct,
+                    "bg_removal_foreground_coverage_pct": primary_qa_report.foreground_coverage_pct,
+                    "bg_removal_edge_halo_pct": primary_qa_report.edge_halo_pct,
+                    "bg_removal_detail": primary_qa_report.detail,
+                })
             # Save RGBA for all input images.
             for rembg_idx, rembg_im_raw in enumerate(imgs_raw):
                 try:
                     if rembg_idx == 0:
                         rgba_out = primary_rgba
                     else:
-                        _, rgba_out = _safe_preprocess_image(pipe, rembg_im_raw, return_rgba=True)
+                        sec_result = _safe_preprocess_image(pipe, rembg_im_raw, return_rgba=True, out_dir=out_dir, uid=uid)
+                        _, rgba_out, _ = sec_result
                     fname = f"{uid}_rembg_{rembg_idx:02d}.png"
                     rgba_out.save(str(out_dir / fname), format="PNG")
                     rembg_export_names.append(fname)
@@ -1559,7 +1942,10 @@ def generate_glb_from_image_bytes_list(
             except Exception as e:
                 last_err = e
 
-                # Progressive OOM handling: preserve texture quality as long as possible
+                # Progressive OOM handling: preserve texture quality as long as possible.
+                # For 1024+ pipelines, step reductions rarely help — peak VRAM is
+                # determined by resolution, not step count.  Skip directly to a
+                # smaller pipeline to avoid burning minutes on doomed retries.
                 if _is_cuda_oom(e):
                     _cuda_empty_cache()
 
@@ -1569,69 +1955,61 @@ def generate_glb_from_image_bytes_list(
                         print("[worker] pipe.run OOM (level 0), clearing cache and retrying", flush=True)
                         continue
 
-                    # Level 1: Reduce sparse_structure steps by 50%
-                    elif oom_quality_level == 1:
-                        oom_quality_level = 2
-                        if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs["sparse_structure_sampler_params"], dict):
-                            orig_steps = kwargs["sparse_structure_sampler_params"].get("steps", 12)
-                            new_steps = max(4, orig_steps // 2)
-                            kwargs["sparse_structure_sampler_params"]["steps"] = new_steps
-                            print(f"[worker] pipe.run OOM (level 1), reducing sparse_structure steps {orig_steps}->{new_steps}", flush=True)
+                    # Levels 1-6: Smart pipeline fallback
+                    # For non-512 pipelines, resolution is the bottleneck — step
+                    # reductions don't meaningfully reduce peak VRAM.  Jump to a
+                    # smaller pipeline with full original steps for best quality.
+                    elif oom_quality_level < 7 and ptype != "512":
+                        if "cascade" in (ptype or "").lower() and oom_quality_level < 4:
+                            # Cascade pipeline: try dropping cascade first (one attempt)
+                            oom_quality_level = 4
+                            fallback_ptype = ptype.replace("_cascade", "").replace("cascade_", "")
+                            print(f"[worker] pipe.run OOM (level 1), dropping cascade: {ptype} -> {fallback_ptype}", flush=True)
+                            if "pipeline_type" in kwargs:
+                                kwargs["pipeline_type"] = fallback_ptype
+                            ptype = fallback_ptype
+                        else:
+                            # Non-cascade 1024 (or cascade already dropped): switch to 512
+                            oom_quality_level = 7
+                            print(f"[worker] pipe.run OOM (level {oom_quality_level - 1}), {ptype} won't fit in VRAM, switching to 512 pipeline", flush=True)
+                            if "pipeline_type" in kwargs:
+                                kwargs["pipeline_type"] = "512"
+                            ptype = "512"
+                        # Restore original steps for best quality at the new pipeline
+                        for _k in ("sparse_structure_sampler_params", "shape_slat_sampler_params", "tex_slat_sampler_params"):
+                            if _k in kwargs and _k in original_kwargs and isinstance(kwargs[_k], dict) and isinstance(original_kwargs.get(_k), dict):
+                                kwargs[_k]["steps"] = original_kwargs[_k].get("steps", 12)
                         continue
 
-                    # Level 2: Reduce shape_slat steps by 50%
-                    elif oom_quality_level == 2:
-                        oom_quality_level = 3
-                        if "shape_slat_sampler_params" in kwargs and isinstance(kwargs["shape_slat_sampler_params"], dict):
-                            orig_steps = kwargs["shape_slat_sampler_params"].get("steps", 12)
-                            new_steps = max(4, orig_steps // 2)
-                            kwargs["shape_slat_sampler_params"]["steps"] = new_steps
-                            print(f"[worker] pipe.run OOM (level 2), reducing shape_slat steps {orig_steps}->{new_steps}", flush=True)
-                        continue
-
-                    # Level 3: Switch from cascade to non-cascade pipeline
-                    elif oom_quality_level == 3 and ptype and "cascade" in ptype.lower():
-                        oom_quality_level = 4
-                        fallback_ptype = ptype.replace("_cascade", "").replace("cascade_", "")
-                        print(f"[worker] pipe.run OOM (level 3), switching from {ptype} to {fallback_ptype}", flush=True)
-                        if "pipeline_type" in kwargs:
-                            kwargs["pipeline_type"] = fallback_ptype
-                        ptype = fallback_ptype
-                        # Restore original steps for the new pipeline
-                        if "sparse_structure_sampler_params" in kwargs and "sparse_structure_sampler_params" in original_kwargs:
-                            kwargs["sparse_structure_sampler_params"]["steps"] = original_kwargs["sparse_structure_sampler_params"].get("steps", 12)
-                        if "shape_slat_sampler_params" in kwargs and "shape_slat_sampler_params" in original_kwargs:
-                            kwargs["shape_slat_sampler_params"]["steps"] = original_kwargs["shape_slat_sampler_params"].get("steps", 12)
-                        if "tex_slat_sampler_params" in kwargs and "tex_slat_sampler_params" in original_kwargs:
-                            kwargs["tex_slat_sampler_params"]["steps"] = original_kwargs["tex_slat_sampler_params"].get("steps", 12)
-                        continue
-
-                    # Level 4: Reduce sparse_structure to minimum
-                    elif oom_quality_level in (3, 4):
-                        oom_quality_level = 5
-                        if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs["sparse_structure_sampler_params"], dict):
-                            kwargs["sparse_structure_sampler_params"]["steps"] = 4
-                            print("[worker] pipe.run OOM (level 4), sparse_structure steps->4", flush=True)
-                        continue
-
-                    # Level 5: Reduce shape_slat to minimum
-                    elif oom_quality_level == 5:
-                        oom_quality_level = 6
-                        if "shape_slat_sampler_params" in kwargs and isinstance(kwargs["shape_slat_sampler_params"], dict):
-                            kwargs["shape_slat_sampler_params"]["steps"] = 4
-                            print("[worker] pipe.run OOM (level 5), shape_slat steps->4", flush=True)
-                        continue
-
-                    # Level 6: Switch to 512 pipeline
-                    elif oom_quality_level in (3, 4, 5, 6) and ptype != "512":
-                        oom_quality_level = 7
-                        print(f"[worker] pipe.run OOM (level 6), switching from {ptype} to 512 pipeline", flush=True)
-                        if "pipeline_type" in kwargs:
-                            kwargs["pipeline_type"] = "512"
-                        ptype = "512"
-                        if "tex_slat_sampler_params" in kwargs and "tex_slat_sampler_params" in original_kwargs:
-                            kwargs["tex_slat_sampler_params"]["steps"] = original_kwargs["tex_slat_sampler_params"].get("steps", 12)
-                        continue
+                    # Levels 1-5 for 512 pipeline: gradual step reductions
+                    elif oom_quality_level < 7 and ptype == "512":
+                        if oom_quality_level == 1:
+                            oom_quality_level = 2
+                            if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs["sparse_structure_sampler_params"], dict):
+                                orig_steps = kwargs["sparse_structure_sampler_params"].get("steps", 12)
+                                new_steps = max(4, orig_steps // 2)
+                                kwargs["sparse_structure_sampler_params"]["steps"] = new_steps
+                                print(f"[worker] pipe.run OOM (level 1), reducing sparse_structure steps {orig_steps}->{new_steps}", flush=True)
+                            continue
+                        elif oom_quality_level == 2:
+                            oom_quality_level = 3
+                            if "shape_slat_sampler_params" in kwargs and isinstance(kwargs["shape_slat_sampler_params"], dict):
+                                orig_steps = kwargs["shape_slat_sampler_params"].get("steps", 12)
+                                new_steps = max(4, orig_steps // 2)
+                                kwargs["shape_slat_sampler_params"]["steps"] = new_steps
+                                print(f"[worker] pipe.run OOM (level 2), reducing shape_slat steps {orig_steps}->{new_steps}", flush=True)
+                            continue
+                        elif oom_quality_level == 3:
+                            oom_quality_level = 5
+                            for _k in ("sparse_structure_sampler_params", "shape_slat_sampler_params"):
+                                if _k in kwargs and isinstance(kwargs[_k], dict):
+                                    kwargs[_k]["steps"] = 4
+                            print("[worker] pipe.run OOM (level 3), all geometry steps->4", flush=True)
+                            continue
+                        else:
+                            # 512 with min steps still OOMs — fall through to image downscaling
+                            oom_quality_level = 7
+                            continue
 
                     # Level 7: Downscale input image to 768
                     elif oom_quality_level == 7:
