@@ -1027,6 +1027,206 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
     return out_rgba
 
 
+def _floodfill_white_bg(rgba: Image.Image) -> Image.Image:
+    """
+    Flood-fill from image borders to remove connected near-white/light-gray
+    background pixels that BiRefNet may have missed.
+
+    This is especially effective for rendered/stylized images with uniform
+    light backgrounds where BiRefNet produces a poor segmentation mask.
+
+    Only runs when TRELLIS2_PREPROCESS_FLOOD_FILL_WHITE_BG=1 (default True).
+    """
+    if not _bool_env("TRELLIS2_PREPROCESS_FLOOD_FILL_WHITE_BG", True):
+        return rgba
+
+    import cv2  # type: ignore
+    from collections import deque
+
+    arr = np.array(rgba)
+    if arr.ndim != 3 or arr.shape[2] < 4:
+        return rgba
+
+    h, w = arr.shape[:2]
+    rgb = arr[:, :, :3].astype(np.float32)
+    alpha = arr[:, :, 3].copy()
+
+    luma = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+    chroma = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+
+    seed_luma_min = float(_int_env("TRELLIS2_FLOOD_SEED_LUMA_MIN", 190))
+    seed_chroma_max = float(_int_env("TRELLIS2_FLOOD_SEED_CHROMA_MAX", 50))
+    fill_luma_min = float(_int_env("TRELLIS2_FLOOD_FILL_LUMA_MIN", 160))
+    fill_chroma_max = float(_int_env("TRELLIS2_FLOOD_FILL_CHROMA_MAX", 55))
+    min_removed_pct = _float_env("TRELLIS2_FLOOD_MIN_REMOVED_PCT", 2.0)
+
+    # Check if corners look like a white/light background.
+    corner_sz = max(5, min(h, w) // 20)
+    corners = [
+        (0, 0, corner_sz, corner_sz),
+        (0, w - corner_sz, corner_sz, w),
+        (h - corner_sz, 0, h, corner_sz),
+        (h - corner_sz, w - corner_sz, h, w),
+    ]
+    white_corner_count = 0
+    for r0, c0, r1, c1 in corners:
+        region = alpha[r0:r1, c0:c1]
+        region_luma = luma[r0:r1, c0:c1]
+        region_chroma = chroma[r0:r1, c0:c1]
+        opaque_frac = float((region > 200).sum()) / max(1, region.size)
+        avg_luma = float(region_luma[region > 200].mean()) if (region > 200).any() else 0
+        avg_chroma = float(region_chroma[region > 200].mean()) if (region > 200).any() else 999
+        if opaque_frac > 0.5 and avg_luma > seed_luma_min and avg_chroma < seed_chroma_max:
+            white_corner_count += 1
+
+    if white_corner_count < 2:
+        return rgba  # No white background detected — skip
+
+    # Fillable mask: opaque AND light AND achromatic
+    fillable = (alpha > 200) & (luma >= fill_luma_min) & (chroma <= fill_chroma_max)
+
+    # BFS from border pixels
+    bg_mask = np.zeros((h, w), dtype=np.uint8)
+    queue = deque()
+
+    for x in range(w):
+        if fillable[0, x]:
+            bg_mask[0, x] = 1
+            queue.append((0, x))
+        if fillable[h - 1, x]:
+            bg_mask[h - 1, x] = 1
+            queue.append((h - 1, x))
+    for y in range(1, h - 1):
+        if fillable[y, 0]:
+            bg_mask[y, 0] = 1
+            queue.append((y, 0))
+        if fillable[y, w - 1]:
+            bg_mask[y, w - 1] = 1
+            queue.append((y, w - 1))
+
+    while queue:
+        cy, cx = queue.popleft()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = cy + dy, cx + dx
+            if 0 <= ny < h and 0 <= nx < w and bg_mask[ny, nx] == 0 and fillable[ny, nx]:
+                bg_mask[ny, nx] = 1
+                queue.append((ny, nx))
+
+    removed_count = int(bg_mask.sum())
+    total_opaque = int((alpha > 200).sum())
+    removed_pct = 100.0 * removed_count / max(1, h * w)
+
+    if removed_pct < min_removed_pct:
+        print(
+            f"[worker] flood_fill_white_bg: only {removed_pct:.1f}% removed "
+            f"(< {min_removed_pct}%), keeping original",
+            flush=True,
+        )
+        return rgba
+
+    # Feather edges: 2px soft transition at boundary
+    out = arr.copy()
+    out[bg_mask > 0, 3] = 0
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated = cv2.dilate(bg_mask, kernel, iterations=1)
+    edge_band = (dilated > 0) & (bg_mask == 0) & (out[:, :, 3] > 0)
+    out[edge_band, 3] = (out[edge_band, 3].astype(np.float32) * 0.4).clip(0, 255).astype(np.uint8)
+
+    # Also zero RGB on fully transparent pixels to avoid bleed in premultiply
+    out[out[:, :, 3] == 0, :3] = 0
+
+    print(
+        f"[worker] flood_fill_white_bg: removed {removed_count} bg pixels ({removed_pct:.1f}%) "
+        f"from {total_opaque} opaque, {white_corner_count}/4 white corners",
+        flush=True,
+    )
+
+    return Image.fromarray(out)
+
+
+def _remove_interior_white_regions(rgba: Image.Image) -> Image.Image:
+    """
+    Detect and remove large enclosed regions of near-white opaque pixels
+    that are likely trapped background (e.g., between arms and body in
+    T-pose characters that border-based flood fill cannot reach).
+
+    Strategy: find connected components of near-white opaque pixels.
+    A component is removed if it is:
+      - Large enough to be background (>= min_region_pct of image)
+      - Uniformly colored (low luminance standard deviation = flat bg)
+      - Not the entire foreground (< max_region_pct)
+    """
+    if not _bool_env("TRELLIS2_PREPROCESS_REMOVE_INTERIOR_WHITE", True):
+        return rgba
+
+    import cv2  # type: ignore
+
+    arr = np.array(rgba)
+    if arr.ndim != 3 or arr.shape[2] < 4:
+        return rgba
+
+    h, w = arr.shape[:2]
+    total_px = h * w
+    rgb = arr[:, :, :3].astype(np.float32)
+    alpha = arr[:, :, 3]
+
+    luma = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+    chroma = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+
+    white_luma_min = float(_int_env("TRELLIS2_INTERIOR_WHITE_LUMA_MIN", 200))
+    white_chroma_max = float(_int_env("TRELLIS2_INTERIOR_WHITE_CHROMA_MAX", 45))
+    min_region_pct = _float_env("TRELLIS2_INTERIOR_WHITE_MIN_PCT", 3.0)
+    max_region_pct = _float_env("TRELLIS2_INTERIOR_WHITE_MAX_PCT", 60.0)
+    max_luma_std = _float_env("TRELLIS2_INTERIOR_WHITE_MAX_LUMA_STD", 12.0)
+
+    # Identify opaque near-white pixels (potential trapped background)
+    near_white = (alpha > 200) & (luma > white_luma_min) & (chroma < white_chroma_max)
+    near_white_pct = 100.0 * float(near_white.sum()) / total_px
+    if near_white_pct < min_region_pct:
+        return rgba
+
+    # Connected component analysis on near-white regions
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        near_white.astype(np.uint8), connectivity=4
+    )
+    if num_labels <= 1:
+        return rgba
+
+    out = arr.copy()
+    removed_total = 0
+
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        area_pct = 100.0 * area / total_px
+        if area_pct < min_region_pct:
+            continue  # Too small — likely a subject highlight
+        if area_pct > max_region_pct:
+            continue  # Too large — could be the actual subject
+
+        region_mask = labels == i
+
+        # Uniformity check: flat background has very low luminance variance.
+        # Real subject whites (fur, shirt highlights) have texture.
+        region_luma_std = float(luma[region_mask].std())
+        if region_luma_std > max_luma_std:
+            continue  # Has texture — likely part of subject
+
+        out[region_mask, 3] = 0
+        out[region_mask, :3] = 0
+        removed_total += area
+
+    if removed_total > 0:
+        print(
+            f"[worker] interior_white_regions: removed {removed_total} pixels "
+            f"({100.0 * removed_total / total_px:.1f}% of image) "
+            f"from {near_white_pct:.1f}% near-white total",
+            flush=True,
+        )
+
+    return Image.fromarray(out)
+
+
 # ---------------------------------------------------------------------------
 # Alpha quality assessment & adaptive step-up
 # ---------------------------------------------------------------------------
@@ -1338,12 +1538,17 @@ def _safe_preprocess_image(
                         flush=True,
                     )
                     continue
+            # Cleanup: remove any enclosed white regions the client BFS missed
+            candidate_rgba = _remove_interior_white_regions(candidate_rgba)
 
         elif level == 1:
             # Run BiRefNet (standard)
             im_rgb = input_im.convert("RGB")
             birefnet_rgba = _run_rembg_rgba(pipe, im_rgb)
-            candidate_rgba = birefnet_rgba
+            # Post-BiRefNet cleanup: flood fill from borders to catch any remaining
+            # white/light-gray background that BiRefNet missed.
+            candidate_rgba = _floodfill_white_bg(birefnet_rgba)
+            candidate_rgba = _remove_interior_white_regions(candidate_rgba)
 
         elif level >= 2:
             # Post-process the BiRefNet result (levels 2 and 3)
@@ -1352,6 +1557,9 @@ def _safe_preprocess_image(
                 im_rgb = input_im.convert("RGB")
                 birefnet_rgba = _run_rembg_rgba(pipe, im_rgb)
             candidate_rgba = _postprocess_alpha(birefnet_rgba, level)
+            # Apply flood fill + interior cleanup after post-processing
+            candidate_rgba = _floodfill_white_bg(candidate_rgba)
+            candidate_rgba = _remove_interior_white_regions(candidate_rgba)
             # Safety: check foreground preservation
             if not _check_foreground_preserved(birefnet_rgba, candidate_rgba):
                 print(
