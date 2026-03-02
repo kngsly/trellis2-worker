@@ -1888,6 +1888,8 @@ def generate_glb_from_image_bytes_list(
         img0 = primary_img
         oom_quality_level = 0
         original_kwargs = dict(kwargs)
+        oom_event_log: list[dict] = []  # timestamped OOM cascade events for diagnostics
+        _gen_t0 = time.monotonic()
         mesh_axis_stats: Optional[tuple[float, float, float]] = None
 
         while True:
@@ -1949,9 +1951,21 @@ def generate_glb_from_image_bytes_list(
                 if _is_cuda_oom(e):
                     _cuda_empty_cache()
 
+                    def _oom_event(action: str, **details: object) -> None:
+                        """Append a timestamped event to the OOM diagnostic log."""
+                        entry: dict = {
+                            "t": round(time.monotonic() - _gen_t0, 2),
+                            "level": oom_quality_level,
+                            "action": action,
+                            "pipeline": ptype,
+                        }
+                        entry.update(details)
+                        oom_event_log.append(entry)
+
                     # Level 0: Simple cache clear
                     if oom_quality_level == 0:
                         oom_quality_level = 1
+                        _oom_event("cache_clear")
                         print("[worker] pipe.run OOM (level 0), clearing cache and retrying", flush=True)
                         continue
 
@@ -1964,14 +1978,16 @@ def generate_glb_from_image_bytes_list(
                             # Cascade pipeline: try dropping cascade first (one attempt)
                             oom_quality_level = 4
                             fallback_ptype = ptype.replace("_cascade", "").replace("cascade_", "")
+                            _oom_event("drop_cascade", old_pipeline=ptype, new_pipeline=fallback_ptype)
                             print(f"[worker] pipe.run OOM (level 1), dropping cascade: {ptype} -> {fallback_ptype}", flush=True)
                             if "pipeline_type" in kwargs:
                                 kwargs["pipeline_type"] = fallback_ptype
                             ptype = fallback_ptype
                         else:
                             # Non-cascade 1024 (or cascade already dropped): switch to 512
+                            _oom_event("switch_512", old_pipeline=ptype, reason="resolution exceeds VRAM")
                             oom_quality_level = 7
-                            print(f"[worker] pipe.run OOM (level {oom_quality_level - 1}), {ptype} won't fit in VRAM, switching to 512 pipeline", flush=True)
+                            print(f"[worker] pipe.run OOM (level 6), {ptype} won't fit in VRAM, switching to 512 pipeline", flush=True)
                             if "pipeline_type" in kwargs:
                                 kwargs["pipeline_type"] = "512"
                             ptype = "512"
@@ -1989,6 +2005,7 @@ def generate_glb_from_image_bytes_list(
                                 orig_steps = kwargs["sparse_structure_sampler_params"].get("steps", 12)
                                 new_steps = max(4, orig_steps // 2)
                                 kwargs["sparse_structure_sampler_params"]["steps"] = new_steps
+                                _oom_event("reduce_ss_steps", old=orig_steps, new=new_steps)
                                 print(f"[worker] pipe.run OOM (level 1), reducing sparse_structure steps {orig_steps}->{new_steps}", flush=True)
                             continue
                         elif oom_quality_level == 2:
@@ -1997,6 +2014,7 @@ def generate_glb_from_image_bytes_list(
                                 orig_steps = kwargs["shape_slat_sampler_params"].get("steps", 12)
                                 new_steps = max(4, orig_steps // 2)
                                 kwargs["shape_slat_sampler_params"]["steps"] = new_steps
+                                _oom_event("reduce_shape_steps", old=orig_steps, new=new_steps)
                                 print(f"[worker] pipe.run OOM (level 2), reducing shape_slat steps {orig_steps}->{new_steps}", flush=True)
                             continue
                         elif oom_quality_level == 3:
@@ -2004,10 +2022,12 @@ def generate_glb_from_image_bytes_list(
                             for _k in ("sparse_structure_sampler_params", "shape_slat_sampler_params"):
                                 if _k in kwargs and isinstance(kwargs[_k], dict):
                                     kwargs[_k]["steps"] = 4
+                            _oom_event("min_geometry_steps")
                             print("[worker] pipe.run OOM (level 3), all geometry steps->4", flush=True)
                             continue
                         else:
                             # 512 with min steps still OOMs — fall through to image downscaling
+                            _oom_event("512_steps_exhausted", reason="falling through to image downscaling")
                             oom_quality_level = 7
                             continue
 
@@ -2021,6 +2041,7 @@ def generate_glb_from_image_bytes_list(
                             new_w = int(w * sc)
                             new_h = int(h * sc)
                             img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                            _oom_event("downscale_image", old=f"{w}x{h}", new=f"{new_w}x{new_h}")
                             print(f"[worker] pipe.run OOM (level 7), downscaled image {w}x{h}->{new_w}x{new_h}", flush=True)
                         continue
 
@@ -2034,6 +2055,7 @@ def generate_glb_from_image_bytes_list(
                             new_w = int(w * sc)
                             new_h = int(h * sc)
                             img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                            _oom_event("downscale_image", old=f"{w}x{h}", new=f"{new_w}x{new_h}")
                             print(f"[worker] pipe.run OOM (level 8), downscaled image {w}x{h}->{new_w}x{new_h}", flush=True)
                         continue
 
@@ -2044,6 +2066,7 @@ def generate_glb_from_image_bytes_list(
                             orig_steps = kwargs["tex_slat_sampler_params"].get("steps", 12)
                             new_steps = max(4, orig_steps // 2)
                             kwargs["tex_slat_sampler_params"]["steps"] = new_steps
+                            _oom_event("reduce_tex_steps", old=orig_steps, new=new_steps)
                             print(f"[worker] pipe.run OOM (level 9), reducing tex_slat steps {orig_steps}->{new_steps}", flush=True)
                         continue
 
@@ -2057,6 +2080,7 @@ def generate_glb_from_image_bytes_list(
                             new_w = int(w * sc)
                             new_h = int(h * sc)
                             img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                            _oom_event("downscale_image", old=f"{w}x{h}", new=f"{new_w}x{new_h}")
                             print(f"[worker] pipe.run OOM (level 10), downscaled image {w}x{h}->{new_w}x{new_h}", flush=True)
                         continue
 
@@ -2065,6 +2089,7 @@ def generate_glb_from_image_bytes_list(
                         oom_quality_level = 12
                         if "tex_slat_sampler_params" in kwargs and isinstance(kwargs["tex_slat_sampler_params"], dict):
                             kwargs["tex_slat_sampler_params"]["steps"] = 4
+                            _oom_event("min_tex_steps")
                             print("[worker] pipe.run OOM (level 11), tex_slat steps->4", flush=True)
                         continue
 
@@ -2079,6 +2104,7 @@ def generate_glb_from_image_bytes_list(
                             new_h = int(h * sc)
                             img0 = img0.resize((new_w, new_h), Image.Resampling.LANCZOS)
                             print(f"[worker] pipe.run OOM (level 12), downscaled to absolute minimum {w}x{h}->{new_w}x{new_h}", flush=True)
+                        _oom_event("absolute_minimum", image=f"{img0.size[0]}x{img0.size[1]}")
                         if "sparse_structure_sampler_params" in kwargs:
                             kwargs["sparse_structure_sampler_params"]["steps"] = 4
                         if "shape_slat_sampler_params" in kwargs:
@@ -2089,6 +2115,7 @@ def generate_glb_from_image_bytes_list(
 
                     # Level 13+: All fallbacks exhausted
                     else:
+                        _oom_event("exhausted", reason="all fallbacks failed")
                         print("[worker] pipe.run OOM after all 13 quality degradation attempts", flush=True)
                         raise RuntimeError("Worker ran out of memory, model was too complex.") from e
 
@@ -2136,6 +2163,8 @@ def generate_glb_from_image_bytes_list(
                 "oom_quality_degradation_level": oom_quality_level,
                 "enable_hd": bool(normalized_request["enable_hd"]),
                 "preprocessed_images": rembg_export_names if rembg_export_names else None,
+                "oom_event_log": oom_event_log if oom_event_log else None,
+                "generation_elapsed_sec": round(time.monotonic() - _gen_t0, 2),
             })
             if "sparse_structure_sampler_params" in kwargs and isinstance(kwargs.get("sparse_structure_sampler_params"), dict):
                 export_meta["sparse_structure_steps"] = kwargs["sparse_structure_sampler_params"].get("steps")
@@ -2172,7 +2201,15 @@ def generate_glb_from_image_bytes_list(
                 if _is_cuda_oom(e) and glb_attempt < 3 and decimation_target > dec_min:
                     oom_retries += 1
                     _cuda_empty_cache()
+                    old_dec = decimation_target
                     decimation_target = max(dec_min, decimation_target // 2)
+                    oom_event_log.append({
+                        "t": round(time.monotonic() - _gen_t0, 2),
+                        "phase": "to_glb",
+                        "action": "reduce_decimation",
+                        "old": old_dec,
+                        "new": decimation_target,
+                    })
                     print(
                         f"[worker] to_glb OOM, retrying with decimation_target={decimation_target}",
                         flush=True,
