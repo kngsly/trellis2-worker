@@ -28,6 +28,45 @@ from PIL import Image
 
 _log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# BEN2 wrapper – makes BEN2 callable like BiRefNet (model(image) -> RGBA)
+# ---------------------------------------------------------------------------
+
+class _BEN2Wrapper:
+    """Thin adapter so BEN2 has the same call/move interface as BiRefNet."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def __call__(self, image):
+        return self.model.inference(image)
+
+    # Device/dtype helpers used by _run_rembg_rgba low-VRAM management.
+    def to(self, *args, **kwargs):
+        self.model.to(*args, **kwargs)
+        return self
+
+    def cpu(self):
+        self.model.cpu()
+        return self
+
+    def float(self):
+        self.model.float()
+        return self
+
+
+def _load_ben2_model():
+    """Load BEN2 from HuggingFace and wrap it for pipeline use."""
+    from ben2 import BEN_Base  # type: ignore
+
+    print("[worker] loading BEN2 background removal model ...", flush=True)
+    model = BEN_Base.from_pretrained("PramaLLC/BEN2")
+    model.train(False)  # set to inference mode
+    return _BEN2Wrapper(model)
+
+
+_REMBG_ENGINE: str = os.environ.get("TRELLIS2_REMBG_ENGINE", "ben2").strip().lower()
+
 _PIPELINE = None
 _READY = {
     "status": "not_started",  # not_started | downloading | loading | ready | error
@@ -390,13 +429,32 @@ def _link_cross_repo_dependencies(model_snapshot_dir: str) -> None:
         alias_path.symlink_to(dep_snapshot, target_is_directory=True)
 
 
+def _load_rembg_for_pipeline(args: dict):
+    """
+    Return a rembg model instance based on TRELLIS2_REMBG_ENGINE.
+    Also mutates *args* so downstream code sees the right config.
+    """
+    if _REMBG_ENGINE == "ben2":
+        print(f"[worker] rembg engine: BEN2", flush=True)
+        return _load_ben2_model()
+
+    # Fallback: BiRefNet (original behaviour)
+    from trellis2.pipelines import rembg  # type: ignore
+
+    rembg_id = os.environ.get("TRELLIS2_REMBG_MODEL_ID", "ZhengPeng7/BiRefNet").strip()
+    rembg_source = _resolve_model_snapshot(rembg_id, f"rembg model '{rembg_id}'")
+    args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_source}}
+    print(f"[worker] rembg engine: BiRefNet ({rembg_id})", flush=True)
+    return getattr(rembg, args["rembg_model"]["name"])(**args["rembg_model"]["args"])
+
+
 def _build_pipeline_with_image_cond_override(model_source: str):
     """
     Build a Trellis2ImageTo3DPipeline but override the image conditioning model
     to avoid gated dependencies (e.g. DINOv3 on HF).
     """
     from trellis2.pipelines.base import Pipeline  # type: ignore
-    from trellis2.pipelines import samplers, rembg  # type: ignore
+    from trellis2.pipelines import samplers  # type: ignore
     from trellis2.modules import image_feature_extractor  # type: ignore
 
     Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
@@ -406,11 +464,6 @@ def _build_pipeline_with_image_cond_override(model_source: str):
 
     dinov2_name = os.environ.get("TRELLIS2_DINOV2_MODEL_NAME", "dinov2_vitl14_reg").strip()
     args["image_cond_model"] = {"name": "DinoV2FeatureExtractor", "args": {"model_name": dinov2_name}}
-
-    if _should_avoid_gated_rembg_deps():
-        rembg_id = os.environ.get("TRELLIS2_REMBG_MODEL_ID", "ZhengPeng7/BiRefNet").strip()
-        rembg_source = _resolve_model_snapshot(rembg_id, f"rembg model '{rembg_id}'")
-        args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_source}}
 
     pipe.sparse_structure_sampler = getattr(samplers, args["sparse_structure_sampler"]["name"])(  # type: ignore[attr-defined]
         **args["sparse_structure_sampler"]["args"]
@@ -433,7 +486,7 @@ def _build_pipeline_with_image_cond_override(model_source: str):
     pipe.image_cond_model = getattr(image_feature_extractor, args["image_cond_model"]["name"])(  # type: ignore[attr-defined]
         **args["image_cond_model"]["args"]
     )
-    pipe.rembg_model = getattr(rembg, args["rembg_model"]["name"])(**args["rembg_model"]["args"])  # type: ignore[attr-defined]
+    pipe.rembg_model = _load_rembg_for_pipeline(args)  # type: ignore[attr-defined]
 
     pipe.low_vram = args.get("low_vram", True)  # type: ignore[attr-defined]
     pipe.default_pipeline_type = args.get("default_pipeline_type", "1024_cascade")  # type: ignore[attr-defined]
@@ -455,16 +508,12 @@ def _build_pipeline_with_rembg_override(model_source: str):
     conditioning model (DINOv3) intact.
     """
     from trellis2.pipelines.base import Pipeline  # type: ignore
-    from trellis2.pipelines import samplers, rembg  # type: ignore
+    from trellis2.pipelines import samplers  # type: ignore
     from trellis2.modules import image_feature_extractor  # type: ignore
 
     Trellis2ImageTo3DPipeline = _lazy_import_pipeline()
     pipe = Pipeline.from_pretrained.__func__(Trellis2ImageTo3DPipeline, model_source, "pipeline.json")  # type: ignore[attr-defined]
     args = getattr(pipe, "_pretrained_args", None) or {}
-
-    rembg_id = os.environ.get("TRELLIS2_REMBG_MODEL_ID", "ZhengPeng7/BiRefNet").strip()
-    rembg_source = _resolve_model_snapshot(rembg_id, f"rembg model '{rembg_id}'")
-    args["rembg_model"] = {"name": "BiRefNet", "args": {"model_name": rembg_source}}
 
     pipe.sparse_structure_sampler = getattr(samplers, args["sparse_structure_sampler"]["name"])(  # type: ignore[attr-defined]
         **args["sparse_structure_sampler"]["args"]
@@ -487,7 +536,7 @@ def _build_pipeline_with_rembg_override(model_source: str):
     pipe.image_cond_model = getattr(image_feature_extractor, args["image_cond_model"]["name"])(  # type: ignore[attr-defined]
         **args["image_cond_model"]["args"]
     )
-    pipe.rembg_model = getattr(rembg, args["rembg_model"]["name"])(**args["rembg_model"]["args"])  # type: ignore[attr-defined]
+    pipe.rembg_model = _load_rembg_for_pipeline(args)  # type: ignore[attr-defined]
 
     pipe.low_vram = args.get("low_vram", True)  # type: ignore[attr-defined]
     pipe.default_pipeline_type = args.get("default_pipeline_type", "1024_cascade")  # type: ignore[attr-defined]
@@ -929,7 +978,7 @@ def _run_rembg_rgba(pipe, im_rgb: Image.Image) -> Image.Image:
         return im_rgb.convert("RGBA")
 
     print(
-        f"[worker] rembg: running BiRefNet on {im_rgb.size[0]}x{im_rgb.size[1]} image (low_vram={low_vram}, device={getattr(pipe, 'device', '?')})",
+        f"[worker] rembg: running {_REMBG_ENGINE} on {im_rgb.size[0]}x{im_rgb.size[1]} image (low_vram={low_vram}, device={getattr(pipe, 'device', '?')})",
         flush=True,
     )
 

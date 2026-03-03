@@ -211,6 +211,10 @@ WORKDIR /app
 COPY requirements-docker.txt /app/requirements-docker.txt
 RUN pip install -r /app/requirements-docker.txt
 
+# BEN2 – background removal (replaces BiRefNet as default rembg engine).
+# Dependencies (einops, timm, torchvision, huggingface_hub) already installed via trellis2.
+RUN pip install git+https://github.com/PramaLLC/BEN2.git
+
 # Extra dep used by TRELLIS.2 demos. Keep pinned to their setup.sh commit.
 RUN pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
 
