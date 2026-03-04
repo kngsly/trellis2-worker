@@ -1380,8 +1380,11 @@ def _assess_alpha_quality(
     # Penalize if too much or too little foreground
     if foreground_coverage_pct > 90.0:
         score -= (foreground_coverage_pct - 90.0) * 0.05
-    if foreground_coverage_pct < 5.0:
-        score -= (5.0 - foreground_coverage_pct) * 0.05
+    if foreground_coverage_pct < 2.0:
+        # Catastrophic: almost no foreground means segmentation completely failed
+        score -= 1.0
+    elif foreground_coverage_pct < 5.0:
+        score -= (5.0 - foreground_coverage_pct) * 0.15
     # Penalize excessive semi-transparency (but some is natural)
     if semi_transparent_pct > 10.0:
         score -= (semi_transparent_pct - 10.0) * 0.01
@@ -1514,18 +1517,16 @@ def _safe_preprocess_image(
     uid: Optional[str] = None,
 ):
     """
-    Preprocess to match the official demo behavior, with adaptive quality
-    checking and step-up system for background removal.
+    Preprocess image to match the official Microsoft TRELLIS.2 demo:
+      1. Resize to max 1024
+      2. If has alpha, use it; otherwise run rembg (BEN2/BiRefNet)
+      3. Crop to square bbox around foreground
+      4. Alpha-premultiply RGB
 
-    Levels:
-      0 — Use input alpha as-is (if client sent alpha)
-      1 — Run BiRefNet (standard background removal)
-      2 — Reuse BiRefNet result + moderate post-processing
-      3 — Reuse BiRefNet result + aggressive post-processing
-
-    Returns an RGB PIL image (alpha premultiplied like upstream).
-    If return_rgba=True, returns (rgb_premultiplied, rgba_transparent, qa_report) tuple.
+    Returns an RGB PIL image (alpha premultiplied).
+    If return_rgba=True, returns (rgb_premultiplied, rgba_transparent, None) tuple.
     """
+    # 1. Resize to max 1024
     max_size = max(input_im.size) if input_im.size else 0
     if max_size > 0:
         scale = min(1.0, 1024.0 / float(max_size))
@@ -1535,10 +1536,7 @@ def _safe_preprocess_image(
                 Image.Resampling.LANCZOS,
             )
 
-    qa_enabled = _bool_env("TRELLIS2_QA_ENABLE", True)
-    max_level = _int_env("TRELLIS2_QA_MAX_LEVEL", 3)
-    save_debug = _bool_env("TRELLIS2_QA_SAVE_DEBUG", False)
-
+    # 2. Background removal — if has alpha, use it; otherwise run rembg
     has_alpha = False
     try:
         if input_im.mode == "RGBA":
@@ -1548,196 +1546,53 @@ def _safe_preprocess_image(
     except Exception:
         has_alpha = False
 
-    original_rgb = np.array(input_im.convert("RGB"))
+    if has_alpha:
+        output = input_im.convert("RGBA")
+        print(f"[worker] preprocess: using existing alpha channel", flush=True)
+    else:
+        im_rgb = input_im.convert("RGB")
+        output = _run_rembg_rgba(pipe, im_rgb)
 
-    # -- Adaptive quality loop --
-    birefnet_rgba: Optional[Image.Image] = None  # cached BiRefNet result
-    best_rgba: Optional[Image.Image] = None
-    best_report: Optional[AlphaQualityReport] = None
-    level_scores: List[str] = []
+    # 3. Crop to square bbox around foreground (matches official demo)
+    output_np = np.array(output)
+    if output_np.ndim == 3 and output_np.shape[2] >= 4:
+        alpha = output_np[:, :, 3]
+        bbox_coords = np.argwhere(alpha > 0.8 * 255)
 
-    start_level = 0 if has_alpha else 1
-    end_level = max_level if qa_enabled else (1 if not has_alpha else 0)
+        if bbox_coords.size > 0:
+            y_min, x_min = bbox_coords.min(axis=0)
+            y_max, x_max = bbox_coords.max(axis=0)
 
-    for level in range(start_level, end_level + 1):
-        t_level = time.time()
+            center_x = (x_min + x_max) / 2.0
+            center_y = (y_min + y_max) / 2.0
+            size = max(x_max - x_min, y_max - y_min)
+            half = size // 2
 
-        if level == 0:
-            # Use input alpha as-is
-            candidate_rgba = input_im.convert("RGBA")
-            # Guardrail: broken/near-empty alpha mattes can cause full-frame box crops.
-            if _bool_env("TRELLIS2_PREPROCESS_REMBG_ON_BAD_ALPHA", True):
-                alpha_probe = np.array(candidate_rgba)[:, :, 3]
-                probe_thresh = _float_env("TRELLIS2_PREPROCESS_ALPHA_BBOX_THRESHOLD", 0.8)
-                bb_probe = _safe_alpha_bbox(alpha_probe, primary_thresh=probe_thresh)
-                bad_alpha = bb_probe is None
-                if not bad_alpha:
-                    w_probe, h_probe = candidate_rgba.size
-                    x0, y0, x1, y1 = bb_probe
-                    bb_area = max(1, (int(x1) - int(x0) + 1) * (int(y1) - int(y0) + 1))
-                    cover = float(bb_area) / float(max(1, w_probe * h_probe))
-                    strong_cover = float((alpha_probe > int(0.8 * 255.0)).mean())
-                    max_cover = _float_env("TRELLIS2_PREPROCESS_BAD_ALPHA_MAX_BBOX_COVER", 0.98)
-                    min_strong = _float_env("TRELLIS2_PREPROCESS_BAD_ALPHA_MIN_STRONG_COVER", 0.70)
-                    if cover >= max_cover and strong_cover < min_strong:
-                        bad_alpha = True
-                if bad_alpha:
-                    print(
-                        "[worker] preprocess: level 0 alpha matte looks unreliable; skipping to level 1",
-                        flush=True,
-                    )
-                    continue
-            # Cleanup: remove any enclosed white regions the client BFS missed
-            candidate_rgba = _remove_interior_white_regions(candidate_rgba)
+            crop_x0 = int(center_x - half)
+            crop_y0 = int(center_y - half)
+            crop_x1 = int(center_x + half)
+            crop_y1 = int(center_y + half)
 
-        elif level == 1:
-            # Run BiRefNet (standard)
-            im_rgb = input_im.convert("RGB")
-            birefnet_rgba = _run_rembg_rgba(pipe, im_rgb)
-            # Post-BiRefNet cleanup: flood fill from borders to catch any remaining
-            # white/light-gray background that BiRefNet missed.
-            candidate_rgba = _floodfill_white_bg(birefnet_rgba)
-            candidate_rgba = _remove_interior_white_regions(candidate_rgba)
-
-        elif level >= 2:
-            # Post-process the BiRefNet result (levels 2 and 3)
-            if birefnet_rgba is None:
-                # BiRefNet hasn't run yet (e.g. started at level 0 and skipped level 1)
-                im_rgb = input_im.convert("RGB")
-                birefnet_rgba = _run_rembg_rgba(pipe, im_rgb)
-            candidate_rgba = _postprocess_alpha(birefnet_rgba, level)
-            # Apply flood fill + interior cleanup after post-processing
-            candidate_rgba = _floodfill_white_bg(candidate_rgba)
-            candidate_rgba = _remove_interior_white_regions(candidate_rgba)
-            # Safety: check foreground preservation
-            if not _check_foreground_preserved(birefnet_rgba, candidate_rgba):
-                print(
-                    f"[worker] preprocess: level {level} rejected (foreground clipped), keeping previous best",
-                    flush=True,
-                )
-                continue
-
-        dt = time.time() - t_level
-
-        # Save debug export if enabled
-        if save_debug and out_dir is not None and uid is not None:
-            try:
-                debug_name = f"{uid}_qa_level{level}.png"
-                candidate_rgba.save(str(out_dir / debug_name), format="PNG")
-            except Exception:
-                pass
-
-        if not qa_enabled:
-            # QA disabled — use this result directly
-            best_rgba = candidate_rgba
-            best_report = AlphaQualityReport(
-                level=level, score=1.0, passed=True,
-                bg_white_residue_pct=0, fg_white_residue_pct=0,
-                shadow_residue_pct=0,
-                foreground_coverage_pct=0, semi_transparent_pct=0,
-                edge_halo_pct=0, opaque_pct=0, transparent_pct=0,
-                detail="qa_disabled",
+            output = output.crop((crop_x0, crop_y0, crop_x1, crop_y1))
+            print(
+                f"[worker] preprocess: cropped to square bbox {crop_x1 - crop_x0}x{crop_y1 - crop_y0} "
+                f"(center={int(center_x)},{int(center_y)} size={size})",
+                flush=True,
             )
-            break
 
-        # Assess quality
-        report = _assess_alpha_quality(candidate_rgba, original_rgb, level)
-        level_scores.append(f"L{level}:{report.score:.2f}")
+    # 4. Alpha-premultiply
+    output_np = np.array(output).astype(np.float32) / 255.0
+    if output_np.ndim == 3 and output_np.shape[2] >= 4:
+        rgb = output_np[:, :, :3] * output_np[:, :, 3:4]
+        rgba_out = output.convert("RGBA")
+    else:
+        rgb = output_np[:, :, :3] if output_np.ndim == 3 else output_np
+        rgba_out = output.convert("RGBA")
 
-        print(
-            f"[worker] preprocess: level {level} QA: score={report.score:.3f} passed={report.passed} "
-            f"bg_white_residue={report.bg_white_residue_pct:.1f}% "
-            f"fg_white_residue={report.fg_white_residue_pct:.1f}% "
-            f"shadow_residue={report.shadow_residue_pct:.1f}% "
-            f"foreground_coverage={report.foreground_coverage_pct:.1f}% "
-            f"semi_transparent={report.semi_transparent_pct:.1f}% "
-            f"edge_halo={report.edge_halo_pct:.1f}% dt={dt:.2f}s",
-            flush=True,
-        )
-
-        # Track best result
-        if best_report is None or report.score > best_report.score:
-            best_rgba = candidate_rgba
-            best_report = report
-
-        if report.passed:
-            if level >= 1:
-                print(
-                    f"[worker] preprocess: level {level} PASSED (score={report.score:.3f})",
-                    flush=True,
-                )
-                break
-            else:
-                # Level 0 (input alpha): always try BiRefNet too so we can compare.
-                # Input alpha from client-side flood-fill may have trapped white regions
-                # that BiRefNet (neural segmentation) handles better.
-                print(
-                    f"[worker] preprocess: level {level} scored {report.score:.3f}, "
-                    f"continuing to BiRefNet for comparison",
-                    flush=True,
-                )
-        else:
-            if level < end_level:
-                print(
-                    f"[worker] preprocess: level {level} FAILED (score={report.score:.3f}), stepping up to level {level + 1}",
-                    flush=True,
-                )
-
-    # QA summary
-    if qa_enabled and level_scores:
-        final_level = best_report.level if best_report else -1
-        final_score = best_report.score if best_report else 0.0
-        print(
-            f"[worker] preprocess: QA summary: {' | '.join(level_scores)} → using level {final_level} (score={final_score:.3f})",
-            flush=True,
-        )
-
-    # Fallback: if nothing was set (shouldn't happen), use input as-is
-    if best_rgba is None:
-        best_rgba = input_im.convert("RGBA")
-        best_report = AlphaQualityReport(
-            level=-1, score=0.0, passed=False,
-            bg_white_residue_pct=0, fg_white_residue_pct=0,
-            shadow_residue_pct=0,
-            foreground_coverage_pct=0, semi_transparent_pct=0,
-            edge_halo_pct=0, opaque_pct=0, transparent_pct=0,
-            detail="fallback",
-        )
-
-    out_rgba = best_rgba
-
-    # -- Existing bbox detection, cropping, alpha premultiply --
-    out_np = np.array(out_rgba)
-    if out_np.ndim != 3 or out_np.shape[2] < 4:
-        rgb_result = out_rgba.convert("RGB")
-        if return_rgba:
-            return rgb_result, out_rgba.convert("RGBA"), best_report
-        return rgb_result
-
-    alpha = out_np[:, :, 3]
-    thresh = _float_env("TRELLIS2_PREPROCESS_ALPHA_BBOX_THRESHOLD", 0.8)
-    pad_px = _int_env("TRELLIS2_PREPROCESS_PAD_PX", 8)
-    bb = _safe_alpha_bbox(alpha, primary_thresh=thresh)
-    if bb is None:
-        rgb = out_np[:, :, :3].astype(np.float32) / 255.0
-        a = alpha.astype(np.float32)[:, :, None] / 255.0
-        rgb = rgb * a
-        rgb_result = Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
-        if return_rgba:
-            return rgb_result, out_rgba, best_report
-        return rgb_result
-
-    w, h = int(out_rgba.size[0]), int(out_rgba.size[1])
-    crop_box = _crop_square_around_bbox(w=w, h=h, bbox_xyxy=bb, pad_px=pad_px)
-    cropped = out_rgba.crop(crop_box)
-
-    cropped_np = np.array(cropped).astype(np.float32) / 255.0
-    rgb = cropped_np[:, :, :3]
-    a = cropped_np[:, :, 3:4]
-    rgb = rgb * a
     rgb_result = Image.fromarray((rgb * 255.0).clip(0, 255).astype(np.uint8))
+
     if return_rgba:
-        return rgb_result, cropped, best_report
+        return rgb_result, rgba_out, None
     return rgb_result
 
 
